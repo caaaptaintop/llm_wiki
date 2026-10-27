@@ -1203,4 +1203,3 @@ mod tests {
         assert!(escape.search("outsideneedle", 5).is_empty());
     }
 }
-
