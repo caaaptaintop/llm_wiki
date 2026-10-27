@@ -1,4 +1,13 @@
 {
+  "reader": {
+    "evidenceDetails": "出处与章节",
+    "maintenance": "维护信息",
+    "sources": "来源",
+    "related": "相关知识",
+    "locator": "原文定位",
+    "epubLocator": "EPUB 内容项 {{item}} · 文本块 {{block}}（不是页码）",
+    "pdfLocator": "PDF 第 {{item}} 页 · 文本块 {{block}}"
+  },
   "app": {
     "title": "LLM Wiki",
     "subtitle": "用 LLM 构建和维护你的个人知识库"
@@ -17,6 +26,7 @@
     "diagram": "图表"
   },
   "nav": {
+    "books": "证据研读",
     "chat": "对话",
     "wiki": "Wiki",
     "sources": "原始资料",
@@ -169,7 +179,7 @@
     "import": "导入",
     "importing": "导入中...",
     "noSources": "暂无资料",
-    "importHint": "导入文档，开始构建你的 Wiki",
+    "importHint": "导入资料后，沿用自动处理队列提取概念、建立关联并合并 Wiki。预处理书籍请选择源包内的 source.md 或源包文件夹，与短材料进入同一自动队列，无需另点主题发现；短材料可直接导入 Markdown / TXT，无需 MinerU。",
     "importFiles": "导入文件",
     "importFolder": "文件夹",
     "importUrls": "网址",
@@ -300,7 +310,8 @@
     },
     "agentMode": "Agent 模式",
     "retrievalMode": "检索模式",
-    "retrievalModeHint": "传统检索保持现有行为；智能检索按证据缺口迭代；只读原文模式只依据原始资料片段回答。",
+    "retrievalModeHint": "传统检索保持现有行为；智能检索补充原文证据（CLI 为一次有界检索，HTTP 模型可迭代）；只读原文仅依据本轮原文片段，不沿用历史回答。",
+    "faithfulNoEvidence": "没有检索到匹配的原文片段，现有证据不足以回答这个问题。",
     "retrievalModes": {
       "standard": "传统检索",
       "smart": "智能检索",
@@ -1175,5 +1186,70 @@
     "minutesAgo": "{{count}} 分钟前",
     "hoursAgo": "{{count}} 小时前",
     "daysAgo": "{{count}} 天前"
+  },
+  "books": {
+    "title": "证据研读",
+    "description": "默认请在「资料」导入书籍与短材料，由自动队列提取概念、建立关联并合并 Wiki。本页是按需逐条核对引文、定向比较的补充，无需每份资料都来这里处理。",
+    "noProject": "请先打开项目，再按需进行证据研读。",
+    "refresh": "重新载入",
+    "import": "导入研读材料",
+    "fileFilter": "材料源文件（Markdown / TXT）",
+    "evidenceHelp": "证据数表示已记录的引用条目数量，可按标注位置回查原文；处理完成不代表已通过人工核验。",
+    "configureLlm": "处理材料、发现主题或生成 Wiki 前，请先在设置中配置用于资料处理的模型。",
+    "settings": "前往设置",
+    "failed": "未能完成：{{message}}",
+    "completed": "全部章节/段落和材料概览已完成。",
+    "incomplete": "这份材料尚未处理完成，请查看章节/段落错误后继续。",
+    "cancelled": "已取消，请核对处理进度后继续。",
+    "cancelling": "正在取消……",
+    "empty": "日常建库请前往「资料」导入书籍和短材料，自动生成并关联 Wiki。如需逐条核对引文或定向比较，可在本页导入材料并保留研读记录。",
+    "version": "版本 {{revision}}",
+    "progress": "已完成 {{done}} / {{total}} 个章节/段落",
+    "selectForSynthesis": "用于按需比较",
+    "original": "源文件",
+    "originalMaterial": "原材料文件名",
+    "fullText": "材料原文",
+    "overview": "材料概览",
+    "process": "处理材料",
+    "resume": "继续处理 / 重试",
+    "warnings": "阅读提醒",
+    "chapters": "章节/段落",
+    "chapterStatus": "状态",
+    "evidence": "证据数",
+    "location": "原文位置",
+    "files": "阅读",
+    "pdfPages": "PDF 第 {{start}}–{{end}} 页",
+    "epubSection": "EPUB 章节：{{section}}",
+    "lines": "正文第 {{start}}–{{end}} 行",
+    "chapterText": "正文",
+    "notes": "笔记",
+    "openChapter": "打开正文：{{title}}",
+    "openNotes": "打开笔记：{{title}}",
+    "synthesis": "按需比较材料",
+    "synthesisHelp": "勾选至少两份已完成的研读材料，再点击「查找比较主题」，或手填主题进行定向比较。此处仅在点击后请求模型；资料自动建库无需此步骤。",
+    "topic": "手填比较主题",
+    "topicPlaceholder": "例如：习惯如何影响决策",
+    "synthesize": "生成比较 Wiki（{{total}} 份）",
+    "noOutput": "未返回生成的 Wiki 文件。",
+    "running": {
+      "import": "正在读取材料并准备章节/段落……",
+      "process": "正在处理材料……",
+      "synthesize": "正在生成比较 Wiki……",
+      "discover": "正在查找比较主题……"
+    },
+    "status": {
+      "prepared": "待处理",
+      "pending": "待处理",
+      "processing": "处理中",
+      "partial": "部分完成",
+      "complete": "已完成",
+      "error": "需重试"
+    },
+    "discoverTopics": "查找比较主题",
+    "topicSuggestions": "比较主题候选",
+    "relatedMaterials": "关联材料（{{total}} 份）",
+    "generateTopic": "生成比较 Wiki",
+    "noTopics": "未找到跨至少两份研读材料的比较主题，可调整勾选或手填主题。",
+    "goToSources": "前往资料"
   }
 }

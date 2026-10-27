@@ -24,6 +24,7 @@ import {
   type SourceImportResult,
 } from "@/lib/source-lifecycle"
 import { filterRawSourceTree } from "@/lib/source-filter"
+import { isPreparedSourceArtifact } from "@/lib/prepared-source"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { importSourceUrls, parseImportUrls, type UrlImportResult } from "@/lib/url-source-import"
@@ -87,7 +88,7 @@ export function SourcesView() {
     const pp = normalizePath(project.path)
     try {
       const tree = await listDirectory(`${pp}/raw/sources`, true)
-      setSources(filterRawSourceTree(tree))
+      setSources(filterPreparedSourceArtifacts(filterRawSourceTree(tree)))
       setRefreshError(null)
     } catch (err) {
       setRefreshError(String(err))
@@ -411,6 +412,8 @@ export function SourcesView() {
         </div>
       </div>
 
+      <p className="shrink-0 border-b bg-muted/20 px-4 py-3 text-xs leading-relaxed text-muted-foreground">{t("sources.importHint")}</p>
+
       <Dialog open={urlDialogOpen} onOpenChange={setUrlDialogOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
@@ -540,7 +543,6 @@ export function SourcesView() {
         {sources.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-3 p-8 text-center text-sm text-muted-foreground">
             <p>{t("sources.noSources")}</p>
-            <p>{t("sources.importHint")}</p>
             <div className="flex gap-2">
               <Button variant="outline" size="sm" onClick={handleImport}>
                 <Plus className="mr-1 h-4 w-4" />
@@ -624,6 +626,20 @@ function countFiles(nodes: FileNode[]): number {
     }
   }
   return count
+}
+
+/** Sources shows managed bundles as one source; the file view keeps all assets. */
+export function filterPreparedSourceArtifacts(nodes: FileNode[]): FileNode[] {
+  return nodes.flatMap((node) => {
+    if (isPreparedSourceArtifact(node.path)) return []
+    if (!node.is_dir) return [node]
+    const children = filterPreparedSourceArtifacts(node.children ?? [])
+    if (children.length > 0) return [{ ...node, children }]
+    // Only prune a newly emptied ancestor or an empty managed package root.
+    // Reuse the artifact classifier on an auxiliary child to identify the root.
+    if (node.children?.length || isPreparedSourceArtifact(`${node.path}/manifest.json`)) return []
+    return [node]
+  })
 }
 
 export interface ImportOutcome {

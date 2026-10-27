@@ -35,6 +35,14 @@ describe("research panel nav state", () => {
     expect(isResearchPanelVisible("chat", true)).toBe(false)
     expect(isResearchPanelVisible("skills", true)).toBe(false)
     expect(isResearchPanelVisible("settings", true)).toBe(false)
+    expect(isResearchPanelVisible("books", true)).toBe(false)
     expect(isResearchPanelVisible("wiki", true)).toBe(true)
+  })
+
+  it("opens research from the standalone books view", () => {
+    expect(nextResearchPanelNavState("books", false)).toEqual({
+      activeView: "wiki",
+      researchPanelOpen: true,
+    })
   })
 })

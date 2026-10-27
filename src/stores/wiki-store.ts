@@ -427,7 +427,9 @@ interface WikiState {
    * one wiki-relative) still works.
    */
   pendingScrollImageSrc: string | null
-  activeView: "chat" | "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "skills" | "settings"
+  /** One-shot, file-bound heading target for cross-page evidence links. */
+  pendingScrollHeading: { path: string; anchor: string } | null
+  activeView: "chat" | "wiki" | "sources" | "books" | "search" | "graph" | "lint" | "review" | "skills" | "settings"
   llmConfig: LlmConfig
   /** Persisted global/default config, kept separate while a project override is effective. */
   globalLlmConfig: LlmConfig
@@ -457,13 +459,14 @@ interface WikiState {
   setProjectPathIndexFromTree: (tree: FileNode[]) => void
   setSelectedFile: (path: string | null) => void
   setFileContent: (content: string) => void
-  openPathInPreview: (path: string) => void
+  openPathInPreview: (path: string, anchor?: string) => void
   openFileInPreview: (path: string, content: string) => void
   closePreview: () => void
   navigatePreviewBack: () => void
   navigatePreviewForward: () => void
   setExternalPreview: (preview: ExternalPreview | null) => void
   setPendingScrollImageSrc: (src: string | null) => void
+  setPendingScrollHeading: (target: WikiState["pendingScrollHeading"]) => void
   setActiveView: (view: WikiState["activeView"]) => void
   setLlmConfig: (config: LlmConfig) => void
   setGlobalLlmConfig: (config: LlmConfig) => void
@@ -500,6 +503,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   previewBackStack: [],
   previewForwardStack: [],
   pendingScrollImageSrc: null,
+  pendingScrollHeading: null,
   activeView: "wiki",
   llmConfig: {
     provider: "openai",
@@ -539,7 +543,7 @@ export const useWikiStore = create<WikiState>((set) => ({
 
   dataVersion: 0,
 
-  setProject: (project) => set({ project }),
+  setProject: (project) => set({ project, pendingScrollHeading: null }),
   setFileTree: (fileTree, options) => {
     if (options?.syncPathIndex === false) {
       set({ fileTree })
@@ -552,6 +556,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   setSelectedFile: (selectedFile) =>
     set((state) => ({
       selectedFile,
+      pendingScrollHeading: null,
       previewContentPath: null,
       externalPreview: null,
       previewBackStack: selectedFile && state.selectedFile && !state.externalPreview && selectedFile !== state.selectedFile
@@ -562,9 +567,10 @@ export const useWikiStore = create<WikiState>((set) => ({
         : selectedFile ? state.previewForwardStack : [],
     })),
   setFileContent: (fileContent) => set({ fileContent }),
-  openPathInPreview: (selectedFile) =>
+  openPathInPreview: (selectedFile, anchor) =>
     set((state) => ({
       selectedFile,
+      pendingScrollHeading: anchor ? { path: selectedFile, anchor } : null,
       previewContentPath: null,
       externalPreview: null,
       activeView: "wiki",
@@ -578,6 +584,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   openFileInPreview: (selectedFile, fileContent) =>
     set((state) => ({
       selectedFile,
+      pendingScrollHeading: null,
       fileContent,
       previewContentPath: selectedFile,
       externalPreview: null,
@@ -592,6 +599,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   closePreview: () =>
     set((state) => ({
       selectedFile: null,
+      pendingScrollHeading: null,
       fileContent: "",
       previewContentPath: null,
       externalPreview: null,
@@ -606,6 +614,7 @@ export const useWikiStore = create<WikiState>((set) => ({
       if (!previous || !state.selectedFile) return state
       return {
         selectedFile: previous,
+        pendingScrollHeading: null,
         fileContent: "",
         previewContentPath: null,
         externalPreview: null,
@@ -619,6 +628,7 @@ export const useWikiStore = create<WikiState>((set) => ({
       if (!next || !state.selectedFile) return state
       return {
         selectedFile: next,
+        pendingScrollHeading: null,
         fileContent: "",
         previewContentPath: null,
         externalPreview: null,
@@ -626,9 +636,10 @@ export const useWikiStore = create<WikiState>((set) => ({
         previewForwardStack: state.previewForwardStack.slice(0, -1),
       }
     }),
-  setExternalPreview: (externalPreview) => set({ externalPreview }),
+  setExternalPreview: (externalPreview) => set({ externalPreview, pendingScrollHeading: null }),
   setPendingScrollImageSrc: (pendingScrollImageSrc) => set({ pendingScrollImageSrc }),
-  setActiveView: (activeView) => set({ activeView, previewReturnView: null }),
+  setPendingScrollHeading: (pendingScrollHeading) => set({ pendingScrollHeading }),
+  setActiveView: (activeView) => set({ activeView, previewReturnView: null, pendingScrollHeading: null }),
   searchApiConfig: {
     provider: "none",
     apiKey: "",

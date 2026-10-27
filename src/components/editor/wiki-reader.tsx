@@ -1,16 +1,24 @@
-import { useMemo } from "react"
+import { useEffect, useMemo, useRef } from "react"
 import ReactMarkdown from "react-markdown"
+import remarkCjkFriendly from "remark-cjk-friendly/parseOnly"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
 import "katex/dist/katex.min.css"
 import { transformImageEmbeds, transformWikilinks } from "@/lib/wikilink-transform"
-import { resolveRelatedSlug } from "@/lib/wiki-page-resolver"
+import { findReaderHeading, resolveReaderLink } from "@/lib/reader-link-resolver"
+import { remarkHideSourceLocations } from "@/lib/remark-hide-source-locations"
+import { remarkReaderLayout } from "@/lib/remark-reader-layout"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
 import { normalizePath } from "@/lib/path-utils"
 import { detectLanguage } from "@/lib/detect-language"
 import { getHtmlLang, getTextDirection } from "@/lib/language-metadata"
 import { useWikiStore } from "@/stores/wiki-store"
+import { useReferenceTitles } from "@/hooks/use-reference-titles"
+import { PREPARED_REFERENCE_PATTERN, referenceLabel, remarkReaderReferences } from "@/lib/reader-presentation"
+import { resolveSourceReference } from "@/lib/wiki-page-resolver"
+import { useAppDialog } from "@/stores/app-dialog-store"
+import { useTranslation } from "react-i18next"
 import { MermaidDiagram, unwrapMermaidPre } from "@/components/mermaid-diagram"
 
 interface WikiReaderProps {
@@ -42,9 +50,32 @@ interface WikiReaderProps {
  * giving the user single-click navigation between pages.
  */
 export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: WikiReaderProps) {
+  const { t } = useTranslation()
+  const appDialog = useAppDialog()
   const project = useWikiStore((s) => s.project)
   const projectPathIndex = useWikiStore((s) => s.projectPathIndex)
   const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
+  const pendingHeading = useWikiStore((s) => s.pendingScrollHeading)
+  const setPendingHeading = useWikiStore((s) => s.setPendingScrollHeading)
+  const selectedFile = useWikiStore((s) => s.selectedFile)
+  const readerRef = useRef<HTMLDivElement>(null)
+  const projectPath = project ? normalizePath(project.path) : null
+  const referencePaths = useMemo(() => {
+    const paths = new Map<string, string>()
+    if (!projectPath) return paths
+    for (const match of body.matchAll(/\[\[([^\]|\n]+)(?:\|[^\]\n]*)?\]\]/g)) {
+      const ref = match[1].trim()
+      const target = resolveReaderLink(projectPathIndex, `#${encodeURIComponent(ref)}`, filePath, projectPath)
+      if (target) paths.set(ref, target.path)
+    }
+    for (const [ref] of body.matchAll(PREPARED_REFERENCE_PATTERN)) {
+      const target = resolveSourceReference(projectPathIndex, ref, `${projectPath}/raw/sources`)
+      if (target.kind === "local" && normalizePath(target.path).startsWith(`${projectPath}/raw/sources/`)) paths.set(ref, target.path)
+    }
+    return paths
+  }, [body, projectPath, projectPathIndex, filePath])
+  const titlePaths = useMemo(() => [...referencePaths.values()], [referencePaths])
+  const titles = useReferenceTitles(titlePaths)
 
   // Image embeds (`![[…]]`) must be rewritten BEFORE the generic
   // wikilink pass, otherwise the embed target gets mangled into a
@@ -76,8 +107,6 @@ export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: Wik
   const renderLanguage = detectLanguage(body)
   const direction = getTextDirection(renderLanguage)
   const htmlLang = getHtmlLang(renderLanguage)
-  const projectPath = project ? normalizePath(project.path) : null
-  const wikiRoot = projectPath ? `${projectPath}/wiki` : null
   // Directory of the file being rendered (project-absolute), so
   // relative image srcs resolve against it like Obsidian does.
   const currentFileDir = useMemo(() => {
@@ -87,42 +116,69 @@ export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: Wik
     return dir || null
   }, [filePath])
 
+  useEffect(() => {
+    if (!pendingHeading || pendingHeading.path !== filePath || selectedFile !== filePath) return
+    const headings = readerRef.current?.querySelectorAll<HTMLElement>("h1,h2,h3,h4,h5,h6")
+    const target = headings && findReaderHeading(Array.from(headings), pendingHeading.anchor)
+    // Preview content loads asynchronously. Keep the file-bound request until
+    // its heading actually renders; later navigation clears stale requests.
+    if (!target) return
+    target.scrollIntoView({ behavior: "auto", block: "start" })
+    setPendingHeading(null)
+  }, [pendingHeading, selectedFile, filePath, body, setPendingHeading])
+
   function handleAnchorClick(e: React.MouseEvent<HTMLAnchorElement>, href: string) {
-    if (!href.startsWith("#")) return
+    // Explicit web links keep their existing behavior. Every filesystem-like
+    // href is intercepted, including invalid/unindexed paths, so the WebView
+    // cannot navigate to an unchecked file or custom protocol as a fallback.
+    if (/^https?:\/\//i.test(href)) return
     e.preventDefault()
-    if (!wikiRoot) return
-    const slug = (() => {
+    if (!projectPath) return
+    if (href.startsWith("#")) {
       try {
-        return decodeURIComponent(href.slice(1))
-      } catch {
-        return href.slice(1)
-      }
-    })()
-    const path = resolveRelatedSlug(projectPathIndex, slug, wikiRoot)
-    if (path) openPathInPreview(path)
+        const anchor = decodeURIComponent(href.slice(1))
+        const headings = readerRef.current?.querySelectorAll<HTMLElement>("h1,h2,h3,h4,h5,h6")
+        const local = headings && findReaderHeading(Array.from(headings), anchor)
+        if (local) { local.scrollIntoView({ behavior: "auto", block: "start" }); return }
+      } catch { return }
+    }
+    const target = resolveReaderLink(projectPathIndex, href, filePath, projectPath)
+    if (target?.anchor) openPathInPreview(target.path, target.anchor)
+    else if (target) openPathInPreview(target.path)
   }
 
   return (
     <div
+      ref={readerRef}
       className="prose prose-invert min-w-0 max-w-none"
       dir={direction}
       lang={htmlLang}
       style={{ textAlign: "start" }}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkCjkFriendly, [remarkReaderLayout, { evidenceLabel: t("reader.evidenceDetails", { defaultValue: "Evidence & source details" }) }], remarkHideSourceLocations, remarkReaderReferences]}
         rehypePlugins={[rehypeKatex]}
         components={{
+          details: ({ node: _node, children, ...props }) => <details {...props} className="not-prose my-3 rounded-md border border-border/50 bg-muted/20 px-3 py-2 text-xs leading-relaxed text-muted-foreground [&_p]:my-2">{children}</details>,
+          summary: ({ node: _node, children, ...props }) => <summary {...props} className="cursor-pointer select-none font-medium text-muted-foreground hover:text-foreground">{children}</summary>,
           p: ({ node, children, ...props }) => <p {...sourceAttrs(node)} {...props}>{children}</p>,
           li: ({ node, children, ...props }) => <li {...sourceAttrs(node)} {...props}>{children}</li>,
           blockquote: ({ node, children, ...props }) => <blockquote {...sourceAttrs(node)} {...props}>{children}</blockquote>,
           a: ({ href, children, ...props }) => {
             const h = typeof href === "string" ? href : ""
             const isWikilink = h.startsWith("#")
+            let label = children
+            if (isWikilink && typeof children === "string") {
+              try {
+                const ref = decodeURIComponent(h.slice(1))
+                // Explicit aliases and ordinary Markdown labels stay intact.
+                if (children === ref) label = referenceLabel(ref, titles[referencePaths.get(ref) ?? ""])
+              } catch { /* Keep malformed link text unchanged. */ }
+            }
             return (
               <a
                 href={h || undefined}
-                onClick={(e) => isWikilink && handleAnchorClick(e, h)}
+                onClick={(e) => handleAnchorClick(e, h)}
                 className={
                   isWikilink
                     ? "cursor-pointer text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary"
@@ -130,9 +186,31 @@ export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: Wik
                 }
                 {...props}
               >
-                {children}
+                {label}
               </a>
             )
+          },
+          span: ({ node, children, ...props }) => {
+            const properties = node?.properties ?? {}
+            const locator = properties["data-reader-locator"] ?? properties.dataReaderLocator
+            const source = properties["data-reader-source"] ?? properties.dataReaderSource
+            if (typeof locator === "string") {
+              const matches = locator.split(" — ").map((part) => part.match(/^(epub-spine|pdf-page):(\d+)\/block:(\d+)$/))
+              if (matches.length <= 2 && matches.every((match) => match !== null)) {
+                const description = matches.map((match) => t(match![1] === "epub-spine" ? "reader.epubLocator" : "reader.pdfLocator", { item: match![2], block: match![3] })).join(" — ")
+                return <button type="button" className="not-prose mx-0.5 inline rounded bg-primary/5 px-1 text-xs font-normal text-primary hover:bg-primary/15" title={description}
+                  aria-label={`${t("reader.locator")} ${String(children)}`}
+                  onClick={() => void appDialog.alert({ title: t("reader.locator"), message: `${description}\n\n${locator}` })}>{children}</button>
+              }
+            }
+            if (typeof source === "string") {
+              const target = referencePaths.get(source)
+              const label = referenceLabel(source, titles[target ?? ""])
+              return target
+                ? <button type="button" className="not-prose cursor-pointer text-primary underline decoration-primary/40 underline-offset-2" title={source} onClick={() => openPathInPreview(target)}>{label}</button>
+                : <span title={source}>{label}</span>
+            }
+            return <span {...props}>{children}</span>
           },
           h1: ({ node, children, ...props }) => (
             <h1

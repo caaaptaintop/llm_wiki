@@ -90,6 +90,10 @@ impl Default for AgentToolOptions {
 pub struct AgentChatRequest {
     pub message: String,
     #[serde(default)]
+    pub retrieval_query: Option<String>,
+    #[serde(default)]
+    pub source_paths: Vec<String>,
+    #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
     pub run_id: Option<String>,
@@ -148,6 +152,8 @@ impl Default for AgentChatRequest {
     fn default() -> Self {
         Self {
             message: String::new(),
+            retrieval_query: None,
+            source_paths: Vec::new(),
             session_id: None,
             run_id: None,
             mode: AgentMode::default(),

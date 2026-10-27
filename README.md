@@ -1,5 +1,7 @@
 # LLM Wiki
 
+> **LLM Wiki Fork:** an incremental adapter for externally prepared source packages, using the original Sources import, ingestion queue, knowledge linking and Wiki maintenance. Books and short notes share that flow. Optional Evidence Reading adds verified chapter quotations, checkpoints and directed comparisons. See [the workflow guide](docs/book-workflow.md). Upstream functionality and credits are retained below.
+
 <p align="center">
   <img src="logo.jpg" width="128" height="128" style="border-radius: 22%;" alt="LLM Wiki Logo">
 </p>

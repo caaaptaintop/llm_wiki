@@ -1,4 +1,9 @@
 {
+  "reader": {
+    "locator": "Posizione nella fonte",
+    "epubLocator": "Elemento EPUB {{item}} · blocco {{block}} (non è una pagina)",
+    "pdfLocator": "Pagina PDF {{item}} · blocco {{block}}"
+  },
   "app": {
     "title": "LLM Wiki",
     "subtitle": "Costruisci e mantieni la tua knowledge base personale con gli LLM"
@@ -17,6 +22,7 @@
     "diagram": "Diagramma"
   },
   "nav": {
+    "books": "Esame delle evidenze",
     "chat": "Chat",
     "wiki": "Wiki",
     "sources": "Fonti",
@@ -169,7 +175,7 @@
     "import": "Importa",
     "importing": "Importazione...",
     "noSources": "Ancora nessuna fonte",
-    "importHint": "Importa dei documenti per iniziare a costruire il tuo wiki",
+    "importHint": "Le fonti importate usano la coda automatica per estrarre concetti, creare collegamenti e integrare le pagine Wiki. Per un libro preelaborato, seleziona source.md nel pacchetto sorgente oppure la cartella del pacchetto. Libri e materiali brevi condividono la stessa coda: non serve cercare separatamente i temi. I materiali brevi possono usare direttamente Markdown / TXT senza MinerU.",
     "importFiles": "Importa file",
     "importFolder": "Cartella",
     "importUrls": "URL",
@@ -1175,5 +1181,70 @@
     "minutesAgo": "{{count}} min fa",
     "hoursAgo": "{{count}} h fa",
     "daysAgo": "{{count}} g fa"
+  },
+  "books": {
+    "title": "Esame delle evidenze",
+    "description": "Usa Fonti come percorso predefinito per importare libri e materiali brevi. La coda automatica estrae concetti, crea collegamenti e integra le pagine Wiki. Questa area facoltativa serve a verificare singole citazioni e fare confronti mirati.",
+    "noProject": "Apri un progetto per esaminare le evidenze quando necessario.",
+    "refresh": "Aggiorna",
+    "import": "Importa per esaminare",
+    "fileFilter": "File sorgente dei materiali (Markdown / TXT)",
+    "evidenceHelp": "Il conteggio indica le citazioni registrate. Controlla il testo originale nelle posizioni indicate; il completamento non equivale alla verifica di una persona.",
+    "configureLlm": "Configura un modello per i documenti nelle Impostazioni prima di elaborare materiali, scoprire temi o creare un Wiki.",
+    "settings": "Apri Impostazioni",
+    "failed": "Operazione non completata: {{message}}",
+    "completed": "Tutti i capitoli/sezioni e la panoramica del materiale sono completi.",
+    "incomplete": "Il materiale non è completo. Controlla gli errori dei capitoli/sezioni e continua.",
+    "cancelled": "Annullato. Controlla i progressi prima di continuare.",
+    "cancelling": "Annullamento…",
+    "empty": "Per costruire normalmente il Wiki, importa libri e materiali brevi in Fonti: le pagine vengono generate e collegate automaticamente. Importa qui solo per verificare singole citazioni o conservare confronti mirati.",
+    "version": "Versione {{revision}}",
+    "progress": "{{done}} / {{total}} capitoli/sezioni completati",
+    "selectForSynthesis": "Includi nel confronto facoltativo",
+    "original": "File sorgente",
+    "originalMaterial": "Nome del file del materiale originale",
+    "fullText": "Testo del materiale",
+    "overview": "Panoramica del materiale",
+    "process": "Elabora materiale",
+    "resume": "Continua / riprova",
+    "warnings": "Avvisi di lettura",
+    "chapters": "Capitoli / sezioni",
+    "chapterStatus": "Stato",
+    "evidence": "Citazioni",
+    "location": "Posizione nella fonte",
+    "files": "Leggi",
+    "pdfPages": "Pagine PDF {{start}}–{{end}}",
+    "epubSection": "Sezione EPUB: {{section}}",
+    "lines": "Righe {{start}}–{{end}} del testo",
+    "chapterText": "Testo",
+    "notes": "Note",
+    "openChapter": "Apri testo: {{title}}",
+    "openNotes": "Apri note: {{title}}",
+    "synthesis": "Confronta materiali su richiesta",
+    "synthesisHelp": "Seleziona almeno due materiali di esame completati, poi clicca Cerca temi di confronto oppure inserisci un tema. Il modello viene chiamato solo dopo un clic; il percorso automatico di Fonti non richiede questo passaggio.",
+    "topic": "Il tuo tema di confronto",
+    "topicPlaceholder": "Ad esempio: come le abitudini influenzano le decisioni",
+    "synthesize": "Crea Wiki di confronto ({{total}} materiali)",
+    "noOutput": "Nessun file Wiki restituito.",
+    "running": {
+      "import": "Lettura del materiale e preparazione di capitoli/sezioni…",
+      "process": "Elaborazione del materiale…",
+      "synthesize": "Creazione del Wiki di confronto…",
+      "discover": "Ricerca di temi di confronto…"
+    },
+    "status": {
+      "prepared": "Pronto",
+      "pending": "In attesa",
+      "processing": "In corso",
+      "partial": "Parzialmente completato",
+      "complete": "Completato",
+      "error": "Da riprovare"
+    },
+    "discoverTopics": "Cerca temi di confronto",
+    "topicSuggestions": "Proposte di temi di confronto",
+    "relatedMaterials": "Materiali pertinenti ({{total}})",
+    "generateTopic": "Crea Wiki di confronto",
+    "noTopics": "Nessun tema di confronto riguarda almeno due materiali esaminati. Modifica la selezione o inserisci un tema.",
+    "goToSources": "Vai alle fonti"
   }
 }

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from "react"
 import ReactMarkdown from "react-markdown"
+import remarkCjkFriendly from "remark-cjk-friendly/parseOnly"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
@@ -207,7 +208,7 @@ function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStrea
         )}
         {answer && (
           <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkMath]}
+            remarkPlugins={[remarkGfm, remarkMath, remarkCjkFriendly]}
             rehypePlugins={[rehypeKatex]}
             components={{
               table: ({ children, ...props }) => (

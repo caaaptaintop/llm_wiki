@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react"
 import { useTranslation } from "react-i18next"
 import { convertFileSrc } from "@tauri-apps/api/core"
 import ReactMarkdown from "react-markdown"
+import remarkCjkFriendly from "remark-cjk-friendly/parseOnly"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
@@ -1445,7 +1446,7 @@ function MarkdownContent({ content }: { content: string }) {
         style={{ textAlign: "start" }}
       >
         <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkMath]}
+          remarkPlugins={[remarkGfm, remarkMath, remarkCjkFriendly]}
           rehypePlugins={[rehypeKatex]}
           components={{
             a: ({ href, children }) => {

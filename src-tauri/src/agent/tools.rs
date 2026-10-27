@@ -25,6 +25,9 @@ use crate::commands::search::{self, SearchEmbeddingConfig};
 use super::types::{AgentKnowledgeContext, AgentReference, AgentVersionSummary};
 use super::workspace::{agent_workspace_path, AGENT_WORKSPACE_DIR};
 
+#[path = "source_search.rs"]
+mod source_search;
+
 // Tool I/O limits are backend security boundaries. Do not relax them only in
 // the UI: API and MCP callers can invoke the same tools without going through
 // React components.
@@ -36,7 +39,7 @@ const MAX_WORKSPACE_WRITE_BYTES: usize = 2 * 1024 * 1024;
 // artifact cannot multiply IPC and in-memory chat costs merely to enable Undo.
 const MAX_WORKSPACE_ROLLBACK_BYTES: u64 = 512 * 1024;
 const MAX_SOURCE_SEARCH_FILES: usize = 10_000;
-const MAX_SOURCE_SNIPPET_CHARS: usize = 500;
+const MAX_SOURCE_SNIPPET_CHARS: usize = 1500;
 const MAX_GRAPH_SEARCH_FILES: usize = 10_000;
 const MAX_KNOWLEDGE_CONTEXT_ITEMS: usize = 20;
 const WEB_SEARCH_TIMEOUT_SECS: u64 = 30;
@@ -142,13 +145,17 @@ impl ToolRegistry for BuiltinToolRegistry {
                         .get("includeContent")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    let source_paths: Vec<String> = serde_json::from_value(input.get("sourcePaths").cloned().unwrap_or_else(|| json!([])))
+                        .map_err(|_| "sourcePaths must be an array of paths".to_string())?;
+                    source_search::validate_scope(context.project_path, &source_paths)?;
                     serde_json::to_value(
-                        run_wiki_search(
+                        run_wiki_search_scoped(
                             context.project_path.to_string(),
                             query,
                             top_k,
                             include_content,
                             context.embedding_config,
+                            &source_paths,
                         )
                         .await?,
                     )
@@ -213,11 +220,13 @@ impl ToolRegistry for BuiltinToolRegistry {
                     let query = tool_query(&input, "source.search")?.to_string();
                     let project_path = context.project_path.to_string();
                     let top_k = tool_top_k(&input);
+                    let source_paths: Vec<String> = serde_json::from_value(input.get("sourcePaths").cloned().unwrap_or_else(|| json!([])))
+                        .map_err(|_| "sourcePaths must be an array of paths".to_string())?;
                     // `search_sources` walks the filesystem synchronously.
                     // Keep it off Tokio worker threads so a large source tree
                     // cannot stall unrelated Agent/API work.
                     let references = tokio::task::spawn_blocking(move || {
-                        search_sources(&project_path, &query, top_k)
+                        source_search::search_scoped(&project_path, &query, top_k, &source_paths)
                     })
                     .await
                     .map_err(|err| format!("source.search worker failed: {err}"))??;
@@ -946,20 +955,38 @@ pub async fn run_wiki_search(
     include_content: bool,
     embedding_config: Option<SearchEmbeddingConfig>,
 ) -> Result<WikiSearchToolOutput, String> {
-    let query_embedding = search::resolve_query_embedding(query, None, embedding_config).await?;
-    let search = search::search_project_inner(
+    run_wiki_search_scoped(project_path, query, top_k, include_content, embedding_config, &[]).await
+}
+
+async fn run_wiki_search_scoped(
+    project_path: String, query: &str, top_k: usize, include_content: bool,
+    embedding_config: Option<SearchEmbeddingConfig>, source_paths: &[String],
+) -> Result<WikiSearchToolOutput, String> {
+    let allowed_pages = if source_paths.is_empty() { None } else {
+        Some(WalkDir::new(Path::new(&project_path).join("wiki")).follow_links(false).into_iter()
+            .filter_entry(|e| !e.file_type().is_symlink() && !is_hidden_rel(&relative_to_project(&project_path, e.path())))
+            .filter_map(Result::ok).filter(|e| e.file_type().is_file()).take(MAX_GRAPH_SEARCH_FILES)
+            .map(|e| relative_to_project(&project_path, e.path()))
+            .filter(|path| wiki_matches_source_scope(&project_path, path, source_paths))
+            .collect::<BTreeSet<_>>())
+    };
+    let query_embedding = if source_paths.is_empty() {
+        search::resolve_query_embedding(query, None, embedding_config).await?
+    } else { None };
+    let search = search::search_project_inner_scoped(
         project_path.clone(),
         query.to_string(),
         top_k,
         include_content,
         query_embedding,
+        allowed_pages,
     )
     .await?;
     let project_for_context = project_path.clone();
-    let context_index =
+    let context_index = if source_paths.is_empty() {
         tokio::task::spawn_blocking(move || build_knowledge_context_index(&project_for_context))
-            .await
-            .map_err(|err| format!("wiki.search graph context worker failed: {err}"));
+            .await.map_err(|err| format!("wiki.search graph context worker failed: {err}"))
+    } else { Ok(BTreeMap::new()) };
     // Retrieval must remain useful if optional graph enrichment fails. The
     // search result is the source of truth; context is a bounded enhancement.
     let mut context_index = context_index.unwrap_or_default();
@@ -988,7 +1015,7 @@ pub async fn run_wiki_search(
         })
         .collect();
     Ok(WikiSearchToolOutput {
-        mode: search.mode,
+        mode: if source_paths.is_empty() { search.mode } else { "scoped-keyword-graph (vectors disabled)".to_string() },
         token_hits: search.token_hits,
         vector_hits: search.vector_hits,
         graph_hits: search.graph_hits,
@@ -2512,140 +2539,30 @@ pub fn search_sources(
     query: &str,
     top_k: usize,
 ) -> Result<Vec<AgentReference>, String> {
-    let query = query.trim();
-    if query.is_empty() {
-        return Err("source.search query is required".to_string());
-    }
-    let root = Path::new(project_path).join("raw").join("sources");
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let lower_query = query.to_lowercase();
-    let query_terms = source_query_terms(&lower_query);
-    let mut refs = Vec::new();
-    let mut seen_files = 0usize;
-    for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = relative_to_project(project_path, entry.path());
-        if is_hidden_rel(&rel) {
-            continue;
-        }
-        seen_files += 1;
-        if seen_files > MAX_SOURCE_SEARCH_FILES {
-            eprintln!(
-                "[Agent] source.search stopped after {MAX_SOURCE_SEARCH_FILES} files in {project_path}"
-            );
-            break;
-        }
-        let Some(ext) = entry
-            .path()
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase())
-        else {
-            continue;
-        };
-        let content = if matches!(
-            ext.as_str(),
-            "md" | "markdown"
-                | "org"
-                | "txt"
-                | "json"
-                | "csv"
-                | "tsv"
-                | "yaml"
-                | "yml"
-                | "xml"
-                | "html"
-        ) {
-            let Ok(content) = fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            content
-        } else if matches!(
-            ext.as_str(),
-            "pdf"
-                | "doc"
-                | "docx"
-                | "docm"
-                | "ppt"
-                | "pps"
-                | "pot"
-                | "pptx"
-                | "pptm"
-                | "ppsx"
-                | "ppsm"
-                | "xls"
-                | "xlsx"
-                | "xlsm"
-                | "xlsb"
-                | "odt"
-                | "ods"
-                | "odp"
-                | "rtf"
-                | "epub"
-                | "mobi"
-        ) {
-            let Some(content) = crate::commands::fs::read_preprocessed_cache(entry.path()) else {
-                continue;
-            };
-            content
-        } else {
-            continue;
-        };
-        let lower = content.to_lowercase();
-        let matched = std::iter::once(lower_query.as_str())
-            .chain(query_terms.iter().map(String::as_str))
-            .find_map(|term| lower.find(term).map(|idx| (idx, term.len())));
-        let Some((byte_idx, _matched_len)) = matched else {
-            continue;
-        };
-        refs.push(AgentReference {
-            title: entry
-                .path()
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&rel)
-                .to_string(),
-            path: rel,
-            kind: "source".to_string(),
-            snippet: Some(snippet_around_byte(
-                &content,
-                byte_idx,
-                MAX_SOURCE_SNIPPET_CHARS,
-            )),
-            score: None,
-            knowledge_context: None,
-        });
-        if refs.len() >= top_k.clamp(1, 10) {
-            break;
-        }
-    }
-    Ok(refs)
+    source_search::search(project_path, query, top_k)
 }
 
-fn source_query_terms(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | ';' | '；' | ':' | '：'))
-        .map(str::trim)
-        .filter(|term| term.chars().count() >= 2)
-        .filter(|term| {
-            !matches!(
-                *term,
-                "raw"
-                    | "source"
-                    | "sources"
-                    | "file"
-                    | "files"
-                    | "原始资料"
-                    | "原始文件"
-                    | "源文件"
-            )
+pub fn source_catalog(project: &str) -> Vec<Value> { source_search::catalog(project) }
+
+pub fn validate_source_scope(project: &str, paths: &[String]) -> Result<(), String> {
+    source_search::validate_scope(project, paths)
+}
+
+pub fn relevant_wiki_excerpt(content: &str, query: &str, budget: usize) -> String {
+    source_search::relevant_excerpt(content, query, budget)
+}
+
+pub fn wiki_matches_source_scope(project: &str, path: &str, sources: &[String]) -> bool {
+    if sources.is_empty() { return true; }
+    let Ok(content) = read_wiki_page(project, path) else { return false; };
+    let declared = extract_frontmatter_list(&content, "sources");
+    // A mixed-source summary cannot establish which source supports a claim.
+    // Keep it out of a restricted answer unless all declared sources are in scope.
+    !declared.is_empty() && declared.iter().all(|source| sources.iter().any(|path| {
+        source == path || path.strip_prefix("raw/sources/").is_some_and(|rel| {
+            rel == source || rel.strip_suffix("/source.md") == Some(source.as_str())
         })
-        .map(ToString::to_string)
-        .collect()
+    }))
 }
 
 fn safe_project_join(project_path: &str, rel: &str) -> Result<PathBuf, String> {
@@ -2870,23 +2787,6 @@ fn relative_to_project(project_path: &str, path: &Path) -> String {
         .replace('\\', "/")
         .trim_start_matches('/')
         .to_string()
-}
-
-fn snippet_around_byte(content: &str, byte_idx: usize, max_chars: usize) -> String {
-    let char_idx = content[..byte_idx.min(content.len())].chars().count();
-    let start = char_idx.saturating_sub(max_chars / 2);
-    let mut snippet = content
-        .chars()
-        .skip(start)
-        .take(max_chars)
-        .collect::<String>();
-    if start > 0 {
-        snippet.insert_str(0, "...");
-    }
-    if content.chars().count() > start + max_chars {
-        snippet.push_str("...");
-    }
-    snippet.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn trim_text(value: &str, max_chars: usize) -> String {

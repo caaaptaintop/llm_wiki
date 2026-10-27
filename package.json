@@ -50,6 +50,7 @@
     "react-markdown": "^10.1.0",
     "react-resizable-panels": "^4.9.0",
     "rehype-katex": "^7.0.1",
+    "remark-cjk-friendly": "2.3.3",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
     "shadcn": "^4.1.2",

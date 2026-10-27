@@ -29,6 +29,7 @@ import {
 import { isPathAllowedBySourceWatch, normalizeSourceWatchConfig } from "@/lib/source-watch-config"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { getRecentProjects, loadSourceWatchConfig } from "@/lib/project-store"
+import { isPreparedSourceArtifact } from "@/lib/prepared-source"
 
 let unlistenQueue: UnlistenFn | null = null
 let unlistenChanged: UnlistenFn | null = null
@@ -425,6 +426,7 @@ async function cleanupDeletedFiles(project: WikiProject, tasks: FileChangeTask[]
 
 function isRawSourcePathForCascade(relativePath: string): boolean {
   const path = normalizePath(relativePath)
+  if (isPreparedSourceArtifact(path)) return false
   if (!path.startsWith("raw/sources/")) return false
   if (path.includes("/.cache/")) return false
   const fileName = path.split("/").pop() ?? ""

@@ -25,6 +25,8 @@ import { getFileCategory, getFileExtension, isTextReadable } from "@/lib/file-ty
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { summarizeAgentFileChange } from "@/lib/agent-file-activity"
 import { ReferenceKnowledgeGraph } from "@/components/chat/reference-knowledge-graph"
+import { buildCliChatEvidence } from "@/lib/cli-chat-evidence"
+import { appendRetrievalPlanContext, planCliRetrieval, type RetrievalPlan, type RetrievalSource } from "@/lib/cli-retrieval-plan"
 
 type InternalChatSendOptions = ChatSendOptions & {
   suppressUserMessage?: boolean
@@ -1050,8 +1052,8 @@ export function ChatPanel() {
 
         const activeConvMessages = conversationMessages(convId)
           .filter((m) => m.role === "user" || m.role === "assistant")
-          .slice(-maxHistoryMessages)
-        const priorMessages = activeConvMessages.slice(0, -1)
+        const priorMessages = (sendOptions.suppressUserMessage ? activeConvMessages : activeConvMessages.slice(0, -1))
+          .slice(-Math.max(1, maxHistoryMessages))
         const priorWireMessages = sendOptions.historyOverride
           ?? chatMessagesToLLM(priorMessages).map((m) => ({
             role: m.role,
@@ -1062,11 +1064,51 @@ export function ChatPanel() {
                   .map((block) => block.text)
                   .join("\n"),
           }))
+        const boundedPlanning = sendOptions.retrievalMode === "smart" || sendOptions.retrievalMode === "faithful"
+        let retrievalQuery: string | undefined
+        let sourcePaths: string[] = []
+        let scopeDescription: string | undefined
+        let retrievalPlan: RetrievalPlan | undefined
+        let sourceCatalog: RetrievalSource[] = []
+        if (boundedPlanning) {
+          setAgentEvents([{ stage: "routing", status: "running", message: "正在解析来源指代并生成中英检索关键词" }])
+          const catalog = await invoke<RetrievalSource[]>("agent_list_sources", { projectId: project?.id ?? "current" })
+          sourceCatalog = catalog
+          if (!isCurrentRun()) return
+          const projectPrefix = project ? `${normalizePath(project.path).replace(/\/+$/, "")}/` : ""
+          const plan = await planCliRetrieval({
+            query: text,
+            catalog,
+            history: maxHistoryMessages > 0 ? priorWireMessages : [],
+            contextFiles: sendOptions.contextFiles.map((path) => {
+              const normalized = normalizePath(path)
+              return projectPrefix && normalized.startsWith(projectPrefix) ? normalized.slice(projectPrefix.length) : normalized
+            }),
+          }, { llmConfig, signal: controller.signal })
+          if (!isCurrentRun()) return
+          if (plan.clarification) {
+            finalized = true
+            finalizeStreamForConversation(convId, plan.clarification, [], [])
+            setAgentEvents([])
+            setStreamingConversationId(null)
+            abortRef.current = null
+            activeRunSessionIdRef.current = null
+            activeRunIdRef.current = null
+            return
+          }
+          retrievalQuery = plan.retrievalQuery
+          sourcePaths = plan.sourcePaths
+          scopeDescription = plan.scopeDescription
+          retrievalPlan = plan
+          setAgentEvents([{ stage: "routing", status: "running", message: `${sourcePaths.length ? `限定 ${sourcePaths.length} 份来源` : "全库"}，执行一轮检索` }])
+        }
         const backendResponse = await invoke<BackendAgentResponse>("agent_start_turn", {
           projectId: project?.id ?? "current",
           llmConfig,
           request: {
             message: text,
+            retrievalQuery,
+            sourcePaths,
             sessionId: convId,
             runId: backendRunId,
             persistSession: false,
@@ -1086,7 +1128,7 @@ export function ChatPanel() {
             historyExplicit: true,
             approvedShellCommands: sendOptions.approvedShellCommands ?? [],
             shellCommand: sendOptions.shellCommand,
-            history: priorWireMessages,
+            history: boundedPlanning ? [] : priorWireMessages,
             images: images.map((image) => ({
               mediaType: image.mediaType,
               dataBase64: image.dataBase64,
@@ -1122,25 +1164,25 @@ export function ChatPanel() {
           return
         }
 
-        const responseContext = backendResponseText(backendResponse).trim()
-        const retrievedContext = responseContext || backendReferences
-          .map((reference) => `${reference.title} (${reference.path})`)
-          .join("\n")
-        const contextText = retrievedContext
-          ? [
-              "You have access to the current LLM Wiki project context below. Use it as retrieved evidence when it is relevant.",
-              "",
-              retrievedContext,
-              "",
-              `User request: ${text}`,
-            ].join("\n")
-          : [
-              "No relevant LLM Wiki evidence was retrieved for this request.",
-              "Answer the request directly with the selected CLI provider. Clearly distinguish general knowledge from project evidence.",
-              "",
-              `User request: ${text}`,
-            ].join("\n")
-        const userContent: string | ContentBlock[] = images.length > 0
+        const cliEvidence = buildCliChatEvidence(sendOptions.retrievalMode, text,
+          backendResponseText(backendResponse), backendResponse.references ?? [])
+        const faithful = sendOptions.retrievalMode === "faithful"
+        if (faithful && !cliEvidence.hasEvidence) {
+          finalized = true
+          finalizeStreamForConversation(convId, `${scopeDescription ? `${scopeDescription}\n\n` : ""}${t("chat.faithfulNoEvidence", {
+            defaultValue: "No matching raw-source excerpts were found. The provided sources are insufficient to answer this question.",
+          })}`, backendReferences, backendSteps)
+          setAgentEvents([])
+          setStreamingConversationId(null)
+          abortRef.current = null
+          activeRunSessionIdRef.current = null
+          activeRunIdRef.current = null
+          return
+        }
+        const contextText = retrievalPlan
+          ? appendRetrievalPlanContext(cliEvidence.context, retrievalPlan, sourceCatalog)
+          : cliEvidence.context
+        const userContent: string | ContentBlock[] = images.length > 0 && !faithful
           ? [
               { type: "text", text: contextText },
               ...images.map((image) => ({
@@ -1153,9 +1195,9 @@ export function ChatPanel() {
         const finalMessages: LlmChatMessage[] = [
           {
             role: "system",
-            content: "Use retrieved LLM Wiki context when available. If none was retrieved, answer directly and do not imply that general knowledge came from the project.",
+            content: cliEvidence.system,
           },
-          ...(sendOptions.historyOverride ?? chatMessagesToLLM(priorMessages)),
+          ...(boundedPlanning ? [] : sendOptions.historyOverride ?? chatMessagesToLLM(priorMessages)),
           { role: "user", content: userContent },
         ]
 
@@ -1485,6 +1527,11 @@ export function ChatPanel() {
           </>
         )}
 
+        {(llmConfig.provider === "codex-cli" || llmConfig.provider === "claude-code") && retrievalMode !== "standard" && (
+          <p className="border-t px-3 py-1.5 text-xs text-muted-foreground">
+            先确认来源与问题，再检索相关内容；来源不明确时会先请你澄清。
+          </p>
+        )}
         <ChatInput
           onSend={handleSend}
           onStop={handleStop}

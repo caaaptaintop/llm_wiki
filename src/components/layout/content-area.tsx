@@ -4,6 +4,7 @@ import { ChatPanel } from "@/components/chat/chat-panel"
 import { SettingsView } from "@/components/settings/settings-view"
 import { SkillsSection } from "@/components/settings/sections/skills-section"
 import { SourcesView } from "@/components/sources/sources-view"
+import { BooksView } from "@/components/books/books-view"
 import { ReviewView } from "@/components/review/review-view"
 import { LintView } from "@/components/lint/lint-view"
 import { SearchView } from "@/components/search/search-view"
@@ -55,6 +56,8 @@ function ActiveContent({
       return <SkillsView />
     case "sources":
       return null
+    case "books":
+      return <BooksView />
     case "review":
       return <ReviewView />
     case "lint":

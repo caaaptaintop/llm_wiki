@@ -34,6 +34,22 @@ export async function writeFileAtomic(path: string, contents: string): Promise<v
   return invoke<void>("write_file_atomic", { path, contents })
 }
 
+/** Publish only when the native Wiki file still equals the supplied snapshot.
+ * null requires absence; an empty string requires an existing empty file.
+ * A conflict rejects without replacing the destination.
+ */
+export async function writeWikiFileIfUnchanged(
+  projectPath: string,
+  relativePath: string,
+  expected: string | null,
+  contents: string,
+): Promise<void> {
+  assertAbsoluteFsPath("writeWikiFileIfUnchanged", projectPath)
+  return invoke<void>("write_wiki_file_if_unchanged", {
+    projectPath, relativePath, expected, contents,
+  })
+}
+
 /**
  * List a directory tree. Dot-prefixed entries (`.claude`, `.env`,
  * `.llm-wiki`, …) are hidden by default; pass `includeHidden: true`
@@ -96,6 +112,11 @@ export async function copyFile(
   destination: string
 ): Promise<void> {
   return invoke("copy_file", { source, destination })
+}
+
+/** Publish a verified new binary file without replacing an existing file. */
+export async function copyFileVerifiedAtomic(source: string, destination: string, sha256: string): Promise<void> {
+  return invoke("copy_file_verified_atomic", { source, destination, sha256 })
 }
 
 export async function copyDirectory(

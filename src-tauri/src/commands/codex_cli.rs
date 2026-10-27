@@ -14,7 +14,7 @@ use std::sync::{
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -157,7 +157,19 @@ pub async fn codex_cli_spawn(
     if let Some(path_env) = child_path_env().await {
         cmd.env("PATH", path_env);
     }
-    cmd.args(build_codex_cli_args(&model, isolate_local_config));
+    let codex_home = match std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => app
+            .path()
+            .home_dir()
+            .map_err(|_| "Cannot resolve Codex home")?
+            .join(".codex"),
+    };
+    if !codex_home.is_absolute() {
+        return Err("Cannot isolate Mem: CODEX_HOME must be an absolute path".to_string());
+    }
+    cmd.args(build_codex_cli_args(&model, isolate_local_config)?);
+    cmd.args(codex_mem_isolation_args(&codex_home)?);
     cmd.current_dir(&working_directory);
 
     cmd.stdin(Stdio::piped())
@@ -312,14 +324,11 @@ fn codex_spawn_timeout_minutes(value: Option<u64>) -> u64 {
     )
 }
 
-fn build_codex_cli_args(model: &str, isolate_local_config: bool) -> Vec<String> {
+fn build_codex_cli_args(model: &str, isolate_local_config: bool) -> Result<Vec<String>, String> {
     let mut args = vec!["-a".to_string(), "never".to_string(), "exec".to_string()];
 
     if isolate_local_config {
-        args.extend([
-            "--ignore-user-config".to_string(),
-            "--ignore-rules".to_string(),
-        ]);
+        return Err("Turn off Codex CLI's 'Isolate local config' option: it bypasses safety configuration. LLM Wiki isolates Nowledge Mem separately for each subprocess.".to_string());
     }
 
     args.extend([
@@ -332,7 +341,135 @@ fn build_codex_cli_args(model: &str, isolate_local_config: bool) -> Vec<String> 
         model.to_string(),
         "-".to_string(),
     ]);
-    args
+    Ok(args)
+}
+
+/// Per-invocation overrides only: keep the user's config, rules, hook trust,
+/// and PreToolUse protections. Never rewrite a shared Codex configuration.
+fn codex_mem_isolation_args(codex_home: &Path) -> Result<Vec<String>, String> {
+    let hooks_path = codex_home.join("hooks.json");
+    let hooks = match std::fs::read_to_string(&hooks_path) {
+        Ok(text) => Some(
+            serde_json::from_str::<serde_json::Value>(&text)
+                .map_err(|_| "Cannot isolate Mem: Codex hooks.json is invalid JSON")?,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err("Cannot isolate Mem: Codex hooks.json is unreadable".to_string()),
+    };
+    mem_isolation_overrides(&hooks_path, hooks.as_ref())
+}
+
+fn mem_isolation_overrides(
+    hooks_path: &Path,
+    hooks: Option<&serde_json::Value>,
+) -> Result<Vec<String>, String> {
+    let mut overrides = vec![
+        "plugins={\"nowledge-mem@nowledge-community\"={enabled=false},\"nowledge-mem@local\"={enabled=false}}".to_string(),
+        "mcp_servers.nowledge-mem.enabled=false".to_string(),
+    ];
+    let mut hook_states = Vec::new();
+    if let Some(hooks) = hooks {
+        let events = hooks
+            .get("hooks")
+            .and_then(|v| v.as_object())
+            .ok_or("Cannot isolate Mem: unsupported Codex hooks.json structure")?;
+        for (event, state_event) in [
+            ("SessionStart", "session_start"),
+            ("SubagentStart", "subagent_start"),
+            ("UserPromptSubmit", "user_prompt_submit"),
+            ("Stop", "stop"),
+        ] {
+            let Some(groups) = events.get(event) else {
+                continue;
+            };
+            let groups = groups
+                .as_array()
+                .ok_or("Cannot isolate Mem: invalid hook groups")?;
+            for (group_index, group) in groups.iter().enumerate() {
+                let entries = group
+                    .get("hooks")
+                    .and_then(|v| v.as_array())
+                    .ok_or("Cannot isolate Mem: invalid hook entries")?;
+                for (hook_index, hook) in entries.iter().enumerate() {
+                    let command = hook.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                    if !is_standalone_mem_hook(command)? {
+                        continue;
+                    }
+                    let id = format!(
+                        "{}:{state_event}:{group_index}:{hook_index}",
+                        hooks_path.display()
+                    );
+                    let quoted = serde_json::to_string(&id).expect("hook ID is serializable");
+                    hook_states.push(format!("{quoted}={{enabled=false}}"));
+                }
+            }
+        }
+    }
+    // CLI key paths split on dots even inside quotes. Keep IDs in the TOML
+    // value instead; inline tables merge without discarding other hook states.
+    if !hook_states.is_empty() {
+        overrides.push(format!("hooks.state={{{}}}", hook_states.join(",")));
+    }
+    Ok(overrides
+        .into_iter()
+        .flat_map(|value| ["-c".to_string(), value])
+        .collect())
+}
+
+fn is_standalone_mem_hook(command: &str) -> Result<bool, String> {
+    const SCRIPTS: &[&str] = &[
+        "nowledge-mem-project-router.py",
+        "nowledge-mem-context.py",
+        "nowledge-mem-stop-save.py",
+        "nowledge-mem-mailbox-stop.py",
+    ];
+    if !SCRIPTS.iter().any(|name| command.contains(name)) {
+        return Ok(false);
+    }
+    if command.contains([';', '|', '&', '\n', '`']) || command.contains("$(") {
+        return Err(
+            "Cannot isolate a combined Mem hook without affecting other commands".to_string(),
+        );
+    }
+    let words = shlex::split(command).ok_or("Cannot isolate an unparseable Mem hook")?;
+    let basename = |word: &str| word.rsplit(['/', '\\']).next().unwrap_or("").to_string();
+    let executable = words.first().map(|w| basename(w)).unwrap_or_default();
+    let is_python = executable == "py"
+        || executable == "py.exe"
+        || executable
+            .strip_suffix(".exe")
+            .unwrap_or(&executable)
+            .strip_prefix("python")
+            .is_some_and(|suffix| suffix.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    let script = if is_python {
+        words
+            .iter()
+            .skip(1)
+            .find(|w| !["-u", "-B", "-I", "-E", "-s", "-S", "-3"].contains(&w.as_str()))
+    } else {
+        words.first()
+    };
+    if !script.is_some_and(|w| SCRIPTS.contains(&basename(w).as_str())) {
+        if [
+            "sh",
+            "bash",
+            "zsh",
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "pwsh",
+            "env",
+        ]
+        .contains(&executable.as_str())
+            || (is_python && script.is_some_and(|w| w.starts_with('-')))
+        {
+            return Err(
+                "Cannot isolate a wrapped Mem hook without affecting other commands".to_string(),
+            );
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 async fn resolve_codex_working_directory(value: Option<String>) -> Result<PathBuf, String> {
@@ -455,7 +592,7 @@ mod tests {
 
     #[test]
     fn codex_args_do_not_isolate_local_config_by_default() {
-        let args = build_codex_cli_args("gpt-5", false);
+        let args = build_codex_cli_args("gpt-5", false).unwrap();
 
         assert!(args
             .windows(3)
@@ -467,20 +604,95 @@ mod tests {
     }
 
     #[test]
-    fn codex_args_can_isolate_user_config_and_rules() {
-        let args = build_codex_cli_args("gpt-5", true);
-        let exec_pos = args.iter().position(|arg| arg == "exec").expect("exec arg");
-        let ignore_config_pos = args
-            .iter()
-            .position(|arg| arg == "--ignore-user-config")
-            .expect("ignore-user-config arg");
-        let ignore_rules_pos = args
-            .iter()
-            .position(|arg| arg == "--ignore-rules")
-            .expect("ignore-rules arg");
+    fn codex_args_reject_broad_isolation_that_bypasses_safety() {
+        assert!(build_codex_cli_args("gpt-6.1-terra", true)
+            .unwrap_err()
+            .contains("safety"));
+    }
 
-        assert!(ignore_config_pos > exec_pos);
-        assert!(ignore_rules_pos > exec_pos);
+    #[test]
+    fn mem_isolation_preserves_security_and_other_hooks() {
+        let hooks = serde_json::json!({"hooks": {
+            "PreToolUse": [{"hooks": [{"command": "python codex_security_pre_tool_hook.py"}]}],
+            "Stop": [{"hooks": [{"command": "plannotator"}, {"command": "python /hooks/nowledge-mem-project-router.py --event stop"}]}],
+            "SessionStart": [{"hooks": [{"command": "python /hooks/nowledge-mem-context.py"}]}]
+        }});
+        let args = mem_isolation_overrides(
+            Path::new("/home/with space/.codex/hooks.json"),
+            Some(&hooks),
+        )
+        .unwrap();
+        let values: Vec<_> = args.chunks_exact(2).map(|x| x[1].as_str()).collect();
+        assert_eq!(values.len(), 3);
+        let hook_states = values
+            .iter()
+            .find(|v| v.starts_with("hooks.state={"))
+            .unwrap();
+        assert!(
+            hook_states.contains("\"/home/with space/.codex/hooks.json:stop:0:1\"={enabled=false}")
+        );
+        assert!(hook_states
+            .contains("\"/home/with space/.codex/hooks.json:session_start:0:0\"={enabled=false}"));
+        assert!(!values
+            .iter()
+            .any(|v| v.contains("pre_tool_use") || v.contains(":stop:0:0")));
+        assert!(!args
+            .iter()
+            .any(|v| v.contains("ignore-") || v.contains("features.hooks") || v.contains("trust")));
+    }
+
+    #[test]
+    fn mem_isolation_rejects_combined_commands_and_malformed_hooks() {
+        for command in [
+            "python nowledge-mem-project-router.py; security-check",
+            "security-check && python nowledge-mem-stop-save.py",
+            "bash -c 'python nowledge-mem-stop-save.py'",
+            "python3 -O /hooks/nowledge-mem-context.py",
+            "python3 -W ignore /hooks/nowledge-mem-stop-save.py",
+            "python3 -O -c 'runpy.run_path(\"nowledge-mem-project-router.py\")'",
+        ] {
+            let hooks = serde_json::json!({"hooks":{"Stop":[{"hooks":[{"command":command}]}]}});
+            assert!(mem_isolation_overrides(Path::new("/tmp/hooks.json"), Some(&hooks)).is_err());
+        }
+        assert!(mem_isolation_overrides(
+            Path::new("/tmp/hooks.json"),
+            Some(&serde_json::json!({"hooks":[]}))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mem_hook_detection_uses_the_executed_script_not_other_arguments() {
+        for command in [
+            "python /hooks/security_audit.py --output /tmp/nowledge-mem-context.py.log",
+            "echo nowledge-mem-project-router.py",
+            "python /hooks/nowledge-mem-context.py.log",
+        ] {
+            assert!(!is_standalone_mem_hook(command).unwrap(), "{command}");
+        }
+        for command in [
+            "\"/Python 3/bin/python3\" \"/hooks with spaces/nowledge-mem-project-router.py\" --event stop",
+            "python3 -u /hooks/nowledge-mem-context.py",
+        ] { assert!(is_standalone_mem_hook(command).unwrap(), "{command}"); }
+    }
+
+    #[test]
+    fn mem_isolation_without_user_hooks_still_disables_mem_plugin_and_mcp() {
+        let args = mem_isolation_overrides(Path::new("/tmp/hooks.json"), None).unwrap();
+        assert_eq!(args.len(), 4);
+        assert!(args.contains(&"mcp_servers.nowledge-mem.enabled=false".to_string()));
+        assert!(args.iter().any(|v| v.starts_with("plugins={")
+            && v.contains("\"nowledge-mem@nowledge-community\"={enabled=false}")));
+    }
+
+    #[test]
+    #[ignore = "exports the actual launch arguments for an opt-in local integration check"]
+    fn export_live_mem_isolation_args() {
+        let home = PathBuf::from(std::env::var_os("WIKI_TEST_CODEX_HOME").expect("Codex home"));
+        let dest = std::env::var_os("WIKI_TEST_CLI_ARGS_OUTPUT").expect("output path");
+        let mut args = build_codex_cli_args("gpt-6.1-terra", false).unwrap();
+        args.extend(codex_mem_isolation_args(&home).unwrap());
+        std::fs::write(dest, serde_json::to_vec_pretty(&args).unwrap()).unwrap();
     }
 
     struct TestDir(PathBuf);

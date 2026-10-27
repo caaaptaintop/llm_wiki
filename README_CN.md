@@ -1,5 +1,7 @@
 # LLM Wiki
 
+> **LLM Wiki Fork：**在原版资料自动入库、关联与 Wiki 维护基础上，增量支持 MinerU 等工具输出的完整源包。书籍与短材料共用原版流程；另提供可选「证据研读」，用于章节引文校验、恢复和定向比较。参见[使用说明](docs/book-workflow.md)。下方保留上游说明与署名。
+
 <p align="center">
   <img src="logo.jpg" width="128" height="128" style="border-radius: 22%;" alt="LLM Wiki Logo">
 </p>

@@ -1239,10 +1239,21 @@ fn extract_odf_text(archive: &mut zip::ZipArchive<fs::File>) -> Result<String, S
     }
 }
 
+// Shared by conditional publication and the editor's ordinary save commands.
+// Hold this only inside spawn_blocking, through comparison and publication.
+static FILE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(super) fn lock_file_writes() -> std::sync::MutexGuard<'static, ()> {
+    FILE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 #[tauri::command]
 pub async fn write_file(path: String, contents: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("write_file", || {
+            let _write_guard = lock_file_writes();
             require_absolute_path("write_file", &path)?;
             let p = Path::new(&path);
             if let Some(parent) = p.parent() {
@@ -1272,6 +1283,7 @@ pub async fn write_file_base64(path: String, base64: String) -> Result<(), Strin
 
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("write_file_base64", || {
+            let _write_guard = lock_file_writes();
             require_absolute_path("write_file_base64", &path)?;
             let bytes = B64
                 .decode(base64.as_bytes())
@@ -1296,51 +1308,191 @@ pub async fn write_file_base64(path: String, base64: String) -> Result<(), Strin
 pub async fn write_file_atomic(path: String, contents: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("write_file_atomic", || {
-            require_absolute_path("write_file_atomic", &path)?;
-            let p = Path::new(&path);
-            if let Some(parent) = p.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path, e))?;
-            }
-
-            let file_name = p
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| "llm-wiki-file".to_string());
-            let tmp_path = p.with_file_name(format!(
-                ".{file_name}.{}.tmp",
-                chrono::Utc::now()
-                    .timestamp_nanos_opt()
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
-            ));
-
-            file_sync::mark_app_write_path(&tmp_path);
-            file_sync::mark_app_write_path(p);
-            crate::commands::file_history::record_file_version(
-                p,
-                "baseline",
-                "before.ui.write_file_atomic",
-            );
-            fs::write(&tmp_path, contents).map_err(|e| {
-                format!("Failed to write temp file '{}': {}", tmp_path.display(), e)
-            })?;
-
-            fs::rename(&tmp_path, p).map_err(|e| {
-                let _ = fs::remove_file(&tmp_path);
-                format!(
-                    "Failed to move temp file '{}' to '{}': {}",
-                    tmp_path.display(),
-                    path,
-                    e
-                )
-            })?;
-            crate::commands::file_history::record_file_version(p, "human", "ui.write_file_atomic");
-            file_sync::mark_app_write_path(p);
-            Ok(())
+            let _write_guard = lock_file_writes();
+            write_file_atomic_locked(&path, &contents, false)
         })
     })
     .await
     .map_err(|e| format!("write_file_atomic blocking task join error: {e}"))?
+}
+
+// Caller must hold FILE_WRITE_LOCK; ordinary atomic-save semantics are unchanged.
+fn write_file_atomic_locked(path: &str, contents: &str, create_only: bool) -> Result<(), String> {
+    require_absolute_path("write_file_atomic", path)?;
+    let p = Path::new(path);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path, e))?;
+    }
+
+    let file_name = p
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "llm-wiki-file".to_string());
+    let tmp_path = p.with_file_name(format!(
+        ".{file_name}.{}.tmp",
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+    ));
+
+    file_sync::mark_app_write_path(&tmp_path);
+    file_sync::mark_app_write_path(p);
+    crate::commands::file_history::record_file_version(
+        p,
+        "baseline",
+        "before.ui.write_file_atomic",
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()))
+        .map_err(|e| format!("Failed to write temp file '{}': {}", tmp_path.display(), e))?;
+
+    let publication = if create_only {
+        // Atomic no-clobber creation also protects against a non-app creator.
+        fs::hard_link(&tmp_path, p)
+    } else {
+        fs::rename(&tmp_path, p)
+    };
+    publication.map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!(
+            "Failed to move temp file '{}' to '{}': {}",
+            tmp_path.display(),
+            path,
+            e
+        )
+    })?;
+    if create_only {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    crate::commands::file_history::record_file_version(p, "human", "ui.write_file_atomic");
+    file_sync::mark_app_write_path(p);
+    Ok(())
+}
+
+fn wiki_write_target(
+    project_path: &str,
+    relative_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    require_absolute_path("write_wiki_file_if_unchanged", project_path)?;
+    let parts: Vec<&str> = relative_path.split('/').collect();
+    if parts.len() < 2
+        || parts[0] != "wiki"
+        || relative_path.contains('\\')
+        || relative_path.contains(':')
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || p.starts_with('.') || p.chars().any(char::is_control))
+        || !parts.last().unwrap().to_ascii_lowercase().ends_with(".md")
+        || parts[1..parts.len() - 1].iter().any(|p| {
+            ["raw", "sources", "media", "books"].contains(&p.to_ascii_lowercase().as_str())
+        })
+        || (parts.len() == 2
+            && [
+                "index.md",
+                "overview.md",
+                "log.md",
+                "schema.md",
+                "purpose.md",
+            ]
+            .contains(&parts[1].to_ascii_lowercase().as_str()))
+    {
+        return Err(
+            "Conditional write requires a non-hidden knowledge Markdown path under wiki/".into(),
+        );
+    }
+    let project =
+        fs::canonicalize(project_path).map_err(|e| format!("Failed to resolve project: {e}"))?;
+    if !project.is_dir() {
+        return Err("Project must be an existing directory".into());
+    }
+    let mut target = project.clone();
+    for (i, part) in parts.iter().enumerate() {
+        target.push(part);
+        match fs::symlink_metadata(&target) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink()
+                    || (i + 1 < parts.len() && !meta.is_dir())
+                    || (i + 1 == parts.len() && !meta.is_file())
+                {
+                    return Err("Conditional write refuses symlinks and non-regular paths".into());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && i + 1 < parts.len() => {
+                fs::create_dir(&target)
+                    .map_err(|e| format!("Failed to create wiki directory: {e}"))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Failed to inspect wiki target: {e}")),
+        }
+        if i + 1 < parts.len() {
+            let canonical = fs::canonicalize(&target)
+                .map_err(|e| format!("Failed to resolve wiki directory: {e}"))?;
+            if !canonical.starts_with(project.join("wiki")) {
+                return Err("Conditional write target escapes the real project wiki".into());
+            }
+        }
+    }
+    Ok(target)
+}
+
+#[cfg(test)]
+thread_local! {
+    static WIKI_AFTER_COMPARE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+fn write_wiki_file_if_unchanged_inner(
+    project_path: &str,
+    relative_path: &str,
+    expected: Option<&str>,
+    contents: &str,
+) -> Result<(), String> {
+    let _write_guard = lock_file_writes();
+    let target = wiki_write_target(project_path, relative_path)?;
+    let current = match fs::read(&target) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("Failed to read conditional write target: {e}")),
+    };
+    if current.as_deref() != expected.map(str::as_bytes) {
+        return Err("Wiki write conflict: file changed or existence differs from expected".into());
+    }
+    #[cfg(test)]
+    WIKI_AFTER_COMPARE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    write_file_atomic_locked(
+        target.to_str().ok_or("Wiki path is not UTF-8")?,
+        contents,
+        expected.is_none(),
+    )
+}
+
+/// Compare exact bytes and publish while holding the same native lock as app saves.
+#[tauri::command]
+pub async fn write_wiki_file_if_unchanged(
+    project_path: String,
+    relative_path: String,
+    expected: Option<String>,
+    contents: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("write_wiki_file_if_unchanged", || {
+            write_wiki_file_if_unchanged_inner(
+                &project_path,
+                &relative_path,
+                expected.as_deref(),
+                &contents,
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("Conditional wiki write blocking task join error: {e}"))?
 }
 
 fn apply_text_selection_edit_inner(
@@ -1351,6 +1503,7 @@ fn apply_text_selection_edit_inner(
     suffix: &str,
     replacement: &str,
 ) -> Result<String, String> {
+    let _write_guard = lock_file_writes();
     let project = fs::canonicalize(project_path)
         .map_err(|err| format!("Failed to resolve project path: {err}"))?;
     let file = fs::canonicalize(file_path)
@@ -1674,6 +1827,56 @@ pub async fn copy_file(source: String, destination: String) -> Result<(), String
     })
     .await
     .map_err(|e| format!("copy_file blocking task join error: {e}"))?
+}
+
+fn copy_file_verified_atomic_inner(source: &str, destination: &str, expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    require_absolute_path("copy_file_verified_atomic", source)?;
+    require_absolute_path("copy_file_verified_atomic", destination)?;
+    let dest = Path::new(destination);
+    let parent = dest.parent().ok_or("Missing destination parent")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let tmp = parent.join(format!(".prepared-{}.tmp", uuid::Uuid::new_v4()));
+    // Create before the cleanup scope: never delete someone else's file on a
+    // (very unlikely) name collision. Only this operation owns this temp file.
+    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+        .map_err(|e| e.to_string())?;
+    let result = (|| {
+        let mut input = fs::File::open(source).map_err(|e| e.to_string())?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 16384];
+        let mut total = 0_usize;
+        loop {
+            let n = input.read(&mut buffer).map_err(|e| e.to_string())?;
+            if n == 0 { break; }
+            total += n;
+            if total > 100 * 1024 * 1024 { return Err("Prepared image exceeds 100 MB".to_string()); }
+            output.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
+            digest.update(&buffer[..n]);
+        }
+        if format!("{:x}", digest.finalize()) != expected {
+            return Err("Prepared image checksum mismatch".to_string());
+        }
+        output.sync_all().map_err(|e| e.to_string())?;
+        drop(output);
+        file_sync::mark_app_write_path(dest);
+        // A hard link publishes the completed same-filesystem temp atomically
+        // and fails if destination exists (rename would overwrite on Unix).
+        fs::hard_link(&tmp, dest).map_err(|e| e.to_string())?;
+        file_sync::mark_app_write_path(dest);
+        Ok(())
+    })();
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
+#[tauri::command]
+pub async fn copy_file_verified_atomic(source: String, destination: String, sha256: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("copy_file_verified_atomic", || copy_file_verified_atomic_inner(&source, &destination, &sha256))
+    }).await.map_err(|e| format!("copy_file_verified_atomic blocking task join error: {e}"))?
 }
 
 /// Recursively copy a directory, preserving structure.
@@ -2084,6 +2287,542 @@ mod anydoc_benchmark;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    fn wiki_conditional_project() -> std::path::PathBuf {
+        let root = make_temp_dir("wiki-conditional");
+        fs::create_dir_all(root.join("wiki/methods")).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn wiki_conditional_native_exact_missing_and_history() {
+        let root = wiki_conditional_project();
+        fs::create_dir_all(root.join(".llm-wiki")).unwrap();
+        fs::write(
+            root.join(".llm-wiki/history-settings.json"),
+            r#"{"enabled":true,"maxVersionsPerFile":10}"#,
+        )
+        .unwrap();
+        let project = root.to_str().unwrap().to_string();
+        let relative = "wiki/methods/条件.md".to_string();
+        let file = root.join(&relative);
+        assert!(write_wiki_file_if_unchanged(
+            project.clone(),
+            relative.clone(),
+            Some("".into()),
+            "bad".into()
+        )
+        .await
+        .is_err());
+        assert!(!file.exists());
+        write_wiki_file_if_unchanged(project.clone(), relative.clone(), None, "".into())
+            .await
+            .unwrap();
+        assert!(write_wiki_file_if_unchanged(
+            project.clone(),
+            relative.clone(),
+            None,
+            "bad".into()
+        )
+        .await
+        .is_err());
+        write_wiki_file_if_unchanged(
+            project.clone(),
+            relative.clone(),
+            Some("".into()),
+            "原文\r\n".into(),
+        )
+        .await
+        .unwrap();
+        assert!(write_wiki_file_if_unchanged(
+            project.clone(),
+            relative.clone(),
+            Some("原文\n".into()),
+            "bad".into()
+        )
+        .await
+        .is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "原文\r\n");
+        write_wiki_file_if_unchanged(
+            project.clone(),
+            relative.clone(),
+            Some("原文\r\n".into()),
+            "补全".into(),
+        )
+        .await
+        .unwrap();
+        let entries = crate::commands::file_history::list_file_history(
+            project,
+            file.to_str().unwrap().into(),
+        )
+        .await
+        .unwrap();
+        assert!(entries.iter().any(|e| e.content == "原文\r\n"));
+        assert!(entries.iter().any(|e| e.content == "补全"));
+        assert_eq!(fs::read_dir(file.parent().unwrap()).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wiki_conditional_rejects_unsafe_paths_without_touching_sources() {
+        let root = wiki_conditional_project();
+        fs::create_dir_all(root.join("raw/sources")).unwrap();
+        fs::write(root.join("raw/sources/original.md"), "raw unchanged").unwrap();
+        let project = root.to_str().unwrap();
+        for relative in [
+            "/tmp/x.md",
+            "C:/x.md",
+            "wiki/../raw/sources/original.md",
+            "raw/sources/original.md",
+            "wiki/.hidden/x.md",
+            "wiki/./x.md",
+            "wiki//x.md",
+            "wiki/x.txt",
+            "wiki/x.md/",
+            "wiki/methods/.x.md",
+            "wiki\\x.md",
+            "wiki/sources/x.md",
+            "wiki/Sources/x.md",
+            "wiki/media/x.md",
+            "wiki/books/x.md",
+            "wiki/INDEX.md",
+            "wiki/raw/x.md",
+        ] {
+            assert!(
+                write_wiki_file_if_unchanged_inner(project, relative, None, "bad").is_err(),
+                "accepted {relative}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("raw/sources/original.md")).unwrap(),
+            "raw unchanged"
+        );
+        assert!(
+            write_wiki_file_if_unchanged_inner("relative-project", "wiki/x.md", None, "bad")
+                .is_err()
+        );
+        fs::create_dir(root.join("wiki/directory.md")).unwrap();
+        assert!(
+            write_wiki_file_if_unchanged_inner(project, "wiki/directory.md", None, "bad").is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wiki_conditional_rejects_symlink_root_directory_file_and_dangling() {
+        use std::os::unix::fs::symlink;
+        let root = wiki_conditional_project();
+        let outside = make_temp_dir("wiki-outside");
+        fs::write(outside.join("original.md"), "original").unwrap();
+        symlink(&outside, root.join("wiki/escape")).unwrap();
+        symlink(outside.join("original.md"), root.join("wiki/linked.md")).unwrap();
+        symlink(outside.join("missing.md"), root.join("wiki/dangling.md")).unwrap();
+        symlink(root.join("wiki/methods"), root.join("wiki/internal")).unwrap();
+        for relative in [
+            "wiki/escape/original.md",
+            "wiki/linked.md",
+            "wiki/dangling.md",
+            "wiki/internal/x.md",
+        ] {
+            assert!(write_wiki_file_if_unchanged_inner(
+                root.to_str().unwrap(),
+                relative,
+                None,
+                "bad"
+            )
+            .is_err());
+        }
+        assert_eq!(
+            fs::read_to_string(outside.join("original.md")).unwrap(),
+            "original"
+        );
+        assert!(!outside.join("missing.md").exists());
+        let linked_root = make_temp_dir("wiki-linked-root");
+        symlink(&outside, linked_root.join("wiki")).unwrap();
+        assert!(write_wiki_file_if_unchanged_inner(
+            linked_root.to_str().unwrap(),
+            "wiki/new.md",
+            None,
+            "bad"
+        )
+        .is_err());
+        assert!(!outside.join("new.md").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(linked_root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn wiki_conditional_missing_creation_and_replacement_have_one_winner() {
+        use std::sync::{Arc, Barrier};
+        let root = wiki_conditional_project();
+        for expected in [None, Some("old")] {
+            let relative = if expected.is_none() {
+                "wiki/new.md"
+            } else {
+                "wiki/existing.md"
+            };
+            if let Some(old) = expected {
+                fs::write(root.join(relative), old).unwrap();
+            }
+            let barrier = Arc::new(Barrier::new(3));
+            let handles: Vec<_> = ["first", "second"]
+                .into_iter()
+                .map(|body| {
+                    let project = root.clone();
+                    let ready = barrier.clone();
+                    std::thread::spawn(move || {
+                        ready.wait();
+                        write_wiki_file_if_unchanged_inner(
+                            project.to_str().unwrap(),
+                            relative,
+                            expected,
+                            body,
+                        )
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+            assert!(results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| e.contains("conflict")));
+            assert!(["first", "second"]
+                .contains(&fs::read_to_string(root.join(relative)).unwrap().as_str()));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wiki_conditional_missing_creation_never_clobbers_an_external_creator() {
+        let root = wiki_conditional_project();
+        let file = root.join("wiki/new.md");
+        let concurrent = file.clone();
+        WIKI_AFTER_COMPARE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(concurrent, "external creator").unwrap();
+            }))
+        });
+        assert!(write_wiki_file_if_unchanged_inner(
+            root.to_str().unwrap(),
+            "wiki/new.md",
+            None,
+            "bad"
+        )
+        .is_err());
+        assert_eq!(fs::read_to_string(file).unwrap(), "external creator");
+        assert_eq!(fs::read_dir(root.join("wiki")).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn wiki_conditional_restore_fixture() -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let root = wiki_conditional_project().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".llm-wiki")).unwrap();
+        fs::write(
+            root.join(".llm-wiki/history-settings.json"),
+            r#"{"enabled":true,"maxVersionsPerFile":10}"#,
+        )
+        .unwrap();
+        let file = root.join("wiki/page.md");
+        fs::write(&file, "archived").unwrap();
+        crate::commands::file_history::record_file_version(
+            &file,
+            "human",
+            "restore.fixture.archived",
+        );
+        fs::write(&file, "old").unwrap();
+        crate::commands::file_history::record_file_version(
+            &file,
+            "human",
+            "restore.fixture.current",
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entries = runtime
+            .block_on(crate::commands::file_history::list_file_history(
+                root.to_str().unwrap().into(),
+                file.to_str().unwrap().into(),
+            ))
+            .unwrap();
+        let entry_id = entries
+            .iter()
+            .find(|e| e.content == "archived")
+            .unwrap()
+            .id
+            .clone();
+        (root, file, entry_id)
+    }
+
+    #[test]
+    fn wiki_conditional_restore_first_rejects_stale_cas_and_preserves_history() {
+        let (root, file, entry_id) = wiki_conditional_restore_fixture();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let restored = crate::commands::file_history::restore_file_history(
+                root.to_str().unwrap().into(),
+                file.to_str().unwrap().into(),
+                entry_id.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(restored, "archived");
+            let result = write_wiki_file_if_unchanged(
+                root.to_str().unwrap().into(),
+                "wiki/page.md".into(),
+                Some("old".into()),
+                "compiled".into(),
+            )
+            .await;
+            assert!(result.unwrap_err().contains("conflict"));
+            assert_eq!(fs::read_to_string(&file).unwrap(), "archived");
+            let entries = crate::commands::file_history::list_file_history(
+                root.to_str().unwrap().into(),
+                file.to_str().unwrap().into(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(entries.len(), 2);
+            assert!(entries
+                .iter()
+                .any(|e| e.id == entry_id && e.content == "archived"));
+            assert!(entries.iter().any(|e| e.content == "old"));
+        });
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wiki_conditional_restore_after_comparison_waits_then_preserves_restored_body_and_history() {
+        use std::sync::mpsc;
+        let (root, file, entry_id) = wiki_conditional_restore_fixture();
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (cas_done_tx, cas_done_rx) = mpsc::channel();
+        let project = root.clone();
+        let conditional = std::thread::spawn(move || {
+            WIKI_AFTER_COMPARE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    checked_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }))
+            });
+            let result = write_wiki_file_if_unchanged_inner(
+                project.to_str().unwrap(),
+                "wiki/page.md",
+                Some("old"),
+                "compiled",
+            );
+            cas_done_tx.send(result).unwrap();
+        });
+        checked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (restore_done_tx, restore_done_rx) = mpsc::channel();
+        let project = root.clone();
+        let destination = file.clone();
+        let restore_id = entry_id.clone();
+        let restore = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            attempt_tx.send(()).unwrap();
+            let result = runtime.block_on(crate::commands::file_history::restore_file_history(
+                project.to_str().unwrap().into(),
+                destination.to_str().unwrap().into(),
+                restore_id,
+            ));
+            restore_done_tx.send(result).unwrap();
+        });
+        attempt_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let blocked = restore_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err();
+        release_tx.send(()).unwrap();
+        // Bounded completion catches a reversed HISTORY_LOCK -> file-lock order.
+        cas_done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("CAS deadlocked with restore")
+            .unwrap();
+        let restored = restore_done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("restore deadlocked with CAS")
+            .unwrap();
+        conditional.join().unwrap();
+        restore.join().unwrap();
+        assert!(blocked, "history restore bypassed the file write lock");
+        assert_eq!(restored, "archived");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "archived");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entries = runtime
+            .block_on(crate::commands::file_history::list_file_history(
+                root.to_str().unwrap().into(),
+                file.to_str().unwrap().into(),
+            ))
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries
+            .iter()
+            .any(|e| e.id == entry_id && e.content == "archived"));
+        for content in ["old", "compiled", "archived"] {
+            assert_eq!(entries.iter().filter(|e| e.content == content).count(), 1);
+        }
+        let ids: std::collections::HashSet<_> = entries.iter().map(|e| &e.id).collect();
+        assert_eq!(ids.len(), entries.len());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn wiki_test_editor_save(kind: u8, root: &Path, file: &Path) -> Result<(), String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let path = file.to_str().unwrap().to_string();
+        runtime.block_on(async {
+            match kind {
+                0 => write_file(path, "user".into()).await,
+                1 => write_file_atomic(path, "user".into()).await,
+                2 => write_file_base64(path, "dXNlcg==".into()).await,
+                _ => apply_text_selection_edit(
+                    root.to_str().unwrap().into(),
+                    path,
+                    "".into(),
+                    "old".into(),
+                    "".into(),
+                    "user".into(),
+                )
+                .await
+                .map(|_| ()),
+            }
+        })
+    }
+
+    #[test]
+    fn wiki_conditional_stale_snapshot_rejects_after_every_editor_save() {
+        let root = wiki_conditional_project();
+        let file = root.join("wiki/page.md");
+        for kind in 0..4 {
+            fs::write(&file, "old").unwrap();
+            wiki_test_editor_save(kind, &root, &file).unwrap();
+            let result = write_wiki_file_if_unchanged_inner(
+                root.to_str().unwrap(),
+                "wiki/page.md",
+                Some("old"),
+                "compiled",
+            );
+            assert!(result.unwrap_err().contains("conflict"));
+            assert_eq!(fs::read_to_string(&file).unwrap(), "user");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wiki_conditional_serializes_app_saves_inserted_after_comparison() {
+        use std::sync::mpsc;
+        for kind in 0..4 {
+            let root = wiki_conditional_project();
+            let file = root.join("wiki/page.md");
+            fs::write(&file, "old").unwrap();
+            let (checked_tx, checked_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let project = root.clone();
+            let conditional = std::thread::spawn(move || {
+                WIKI_AFTER_COMPARE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        checked_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }))
+                });
+                write_wiki_file_if_unchanged_inner(
+                    project.to_str().unwrap(),
+                    "wiki/page.md",
+                    Some("old"),
+                    "compiled",
+                )
+            });
+            checked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let (attempt_tx, attempt_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let project = root.clone();
+            let destination = file.clone();
+            let editor = std::thread::spawn(move || {
+                attempt_tx.send(()).unwrap();
+                let result = wiki_test_editor_save(kind, &project, &destination);
+                done_tx.send(result).unwrap();
+            });
+            attempt_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let blocked = done_rx.recv_timeout(Duration::from_millis(100)).is_err();
+            release_tx.send(()).unwrap();
+            conditional.join().unwrap().unwrap();
+            editor.join().unwrap();
+            assert!(blocked, "editor command {kind} bypassed the write lock");
+            let result = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            if kind == 3 {
+                assert!(result.unwrap_err().contains("changed after the selection"));
+                assert_eq!(fs::read_to_string(&file).unwrap(), "compiled");
+            } else {
+                result.unwrap();
+                assert_eq!(fs::read_to_string(&file).unwrap(), "user");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn prepared_atomic_copy_checks_before_publish_and_can_retry() {
+        use sha2::{Digest, Sha256};
+        let root = make_temp_dir("prepared-retry");
+        let source = root.join("input.png");
+        let target = root.join("image.png");
+        fs::write(&source, vec![7_u8; 40_000]).unwrap();
+        let checksum = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
+        let src = source.to_str().unwrap();
+        let dest = target.to_str().unwrap();
+        // Failure after copying all bytes must not publish a partial image or
+        // leave a temp file that a retry mistakes for a user's edited asset.
+        assert!(copy_file_verified_atomic_inner(src, dest, &"0".repeat(64)).is_err());
+        assert!(!target.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        copy_file_verified_atomic_inner(src, dest, &checksum).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&target).unwrap());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_atomic_copy_never_overwrites_existing_assets() {
+        use sha2::{Digest, Sha256};
+        let root = make_temp_dir("prepared-preserve");
+        let source = root.join("input.png");
+        let target = root.join("image.png");
+        fs::write(&source, b"original").unwrap();
+        fs::write(&target, b"manual edit").unwrap();
+        let checksum = format!("{:x}", Sha256::digest(b"original"));
+        assert!(copy_file_verified_atomic_inner(source.to_str().unwrap(), target.to_str().unwrap(), &checksum).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"manual edit");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_atomic_copy_cleans_up_a_read_failure() {
+        let root = make_temp_dir("prepared-read-failure");
+        let target = root.join("image.png");
+        assert!(copy_file_verified_atomic_inner(root.join("missing.png").to_str().unwrap(), target.to_str().unwrap(), &"0".repeat(64)).is_err());
+        assert!(!target.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
     use std::io::Write;
 
     fn tmp_file_with_extension(extension: &str, bytes: &[u8]) -> std::path::PathBuf {

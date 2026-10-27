@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest"
 import { getAppLayoutVisibility } from "./app-layout-visibility"
 
 describe("getAppLayoutVisibility", () => {
+  it("gives books the full work area even when research is open", () => {
+    expect(getAppLayoutVisibility("books", true)).toEqual({
+      showLeftPanel: false,
+      hasRightPanel: false,
+    })
+  })
   it("keeps chat standalone without project side panels", () => {
     // Chat owns its conversation list and reference preview area. It must not
     // also inherit the project knowledge/file panel used by workspace views.

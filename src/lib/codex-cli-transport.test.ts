@@ -94,6 +94,23 @@ describe("buildPrompt", () => {
 })
 
 describe("streamCodexCli", () => {
+  it.each(["live", "replay"])("preserves complete message boundaries in %s output", async (mode) => {
+    const tokens: string[] = []
+    const callbacks = { onToken: (text: string) => tokens.push(text), onDone: vi.fn(), onError: vi.fn() }
+    const stream = streamCodexCli(useWikiStore.getState().llmConfig, [{ role: "user", content: "Merge." }], callbacks)
+    await vi.waitFor(() => expect(tauriMocks.invoke).toHaveBeenCalledTimes(1))
+    const { streamId } = tauriMocks.invoke.mock.calls[0][1] as { streamId: string }
+    const lines = ["---END FILE---", "合并稿已交付。"].map((text) => JSON.stringify({
+      type: "item.completed", item: { type: "agent_message", text },
+    }))
+    if (mode === "live") lines.forEach((line) => tauriMocks.emit(`codex-cli:${streamId}`, line))
+    tauriMocks.emit(`codex-cli:${streamId}:done`, { code: 0, stderr: "", stdout: lines.join("\n") })
+    await stream
+    expect(tokens.join("")).toBe("---END FILE---\n\n合并稿已交付。")
+    expect(callbacks.onError).not.toHaveBeenCalled()
+    expect(callbacks.onDone).toHaveBeenCalledOnce()
+  })
+
   it("does not resolve until the Codex CLI done event arrives", async () => {
     const callbacks = {
       onToken: vi.fn(),

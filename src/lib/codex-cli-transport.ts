@@ -98,6 +98,13 @@ export async function streamCodexCli(
 
   const unparsedLines: string[] = []
   let unparsedSize = 0
+  const emitAgentMessage = (text: string) => {
+    // Each event is a complete message, not a token delta. Preserve the
+    // boundary so a later CLI status cannot join a document's closing marker.
+    if (emittedAgentMessage) onToken("\n\n")
+    emittedAgentMessage = true
+    onToken(text)
+  }
   function captureUnparsed(line: string) {
     if (unparsedSize >= 4096) return
     const trimmed = line.trim()
@@ -125,8 +132,7 @@ export async function streamCodexCli(
     for (const line of stdout.split(/\r?\n/)) {
       const token = parseCodexCliLine(line)
       if (token !== null) {
-        emittedAgentMessage = true
-        onToken(token)
+        emitAgentMessage(token)
       }
     }
   }
@@ -146,8 +152,7 @@ export async function streamCodexCli(
     unlistenData = await listen<string>(`codex-cli:${streamId}`, (event) => {
       const token = parseCodexCliLine(event.payload)
       if (token !== null) {
-        emittedAgentMessage = true
-        onToken(token)
+        emitAgentMessage(token)
       } else {
         captureUnparsed(event.payload)
       }

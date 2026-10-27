@@ -316,6 +316,27 @@ describe("project file sync", () => {
     ])
   })
 
+  it("queues only a prepared bundle entry, ignoring asset creation and deletion", async () => {
+    vi.useFakeTimers()
+    const { startProjectFileSync } = await import("@/lib/project-file-sync")
+    const { useWikiStore } = await import("@/stores/wiki-store")
+    const project = { id: "A", name: "A", path: "/tmp/a" }
+    useWikiStore.getState().setProject(project)
+    void startProjectFileSync(project)
+    await vi.waitFor(() => expect(mocks.listen).toHaveBeenCalledTimes(2))
+    const bundle = `raw/sources/Book--${"a".repeat(64)}.wiki-source`
+    mocks.emit("file-sync://changed", {
+      projectId: "A",
+      tasks: [
+        ["source.md", "created"], ["manifest.json", "created"], ["images/cover.png", "created"], ["images/old.png", "deleted"],
+      ].map(([file, kind], i) => ({ id: `bundle-${i}`, projectId: "A", path: `${bundle}/${file}`, kind, status: "done", createdAt: 1, updatedAt: 1, retryCount: 0, needsRerun: false })),
+    })
+    await vi.advanceTimersByTimeAsync(250)
+    expect(mocks.enqueueBatch).toHaveBeenCalledWith("A", [{ sourcePath: `${bundle}/source.md`, folderContext: bundle.slice("raw/sources/".length) }])
+    expect(mocks.removeFromIngestCache).not.toHaveBeenCalled()
+    expect(mocks.findRelatedWikiPages).not.toHaveBeenCalled()
+  })
+
   it("migrates an unchanged source move without deleting or re-ingesting it", async () => {
     vi.useFakeTimers()
     const { startProjectFileSync } = await import("@/lib/project-file-sync")
