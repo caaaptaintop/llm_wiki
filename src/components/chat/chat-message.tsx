@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react"
 import { useTranslation } from "react-i18next"
 import { convertFileSrc } from "@tauri-apps/api/core"
 import ReactMarkdown from "react-markdown"
+import remarkCjkFriendly from "remark-cjk-friendly/parseOnly"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
@@ -27,7 +28,8 @@ import { getTaskLlmConfig } from "@/lib/llm-task-routing"
 import { messageImageToDataUrl } from "@/lib/chat-image-utils"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
 import { transformImageEmbeds } from "@/lib/wikilink-transform"
-import { findRawSourceForImage, imageUrlToAbsolute } from "@/lib/raw-source-resolver"
+import { findRawSourceImageTarget } from "@/lib/raw-source-resolver"
+import { imageScrollTarget } from "@/lib/reader-image-navigation"
 import { detectLanguage } from "@/lib/detect-language"
 import { getHtmlLang, getTextDirection } from "@/lib/language-metadata"
 import { MermaidDiagram, unwrapMermaidPre } from "@/components/mermaid-diagram"
@@ -851,7 +853,7 @@ function CitedReferencesPanel({
    * Open the raw source file for a page's first image and stage a
    * scroll target so the markdown preview lands on that image.
    * Mirrors the lightbox "Jump to source document" path in
-   * search-view — same `findRawSourceForImage` resolver, same
+   * search-view — same byte-verified source/image resolver, same
    * `pendingScrollImageSrc` store handoff, same fallback to
    * opening the wiki page when no raw source is found.
    */
@@ -859,11 +861,12 @@ function CitedReferencesPanel({
     async (firstUrl: string, fallbackPath: string) => {
       if (!project) return
       const pp = normalizePath(project.path)
-      const rawPath = await findRawSourceForImage(firstUrl, pp)
-      if (rawPath) {
-        try {
+      try {
+        const raw = await findRawSourceImageTarget(firstUrl, pp)
+        if (raw) {
+          const rawPath = raw.path
           const content = await readFile(rawPath)
-          setPendingScrollImageSrc(imageUrlToAbsolute(firstUrl, pp))
+          if (useWikiStore.getState().project?.path !== project.path) return
           if (onOpenReferencePreview) {
             onOpenReferencePreview({
               title: getFileName(rawPath),
@@ -873,11 +876,11 @@ function CitedReferencesPanel({
           } else {
             openFileInPreview(rawPath, content)
           }
-          console.log(`[refs:image-jump] ${firstUrl} → raw source ${rawPath}`)
+          setPendingScrollImageSrc(imageScrollTarget(rawPath, raw.imageSrc))
           return
-        } catch (err) {
-          console.warn(`[refs:image-jump] failed to read ${rawPath}:`, err)
         }
+      } catch (err) {
+        console.warn("[refs:image-jump] failed to resolve/read source:", err)
       }
       // Fallback: open the wiki summary itself with same scroll
       // target — at least the safety-net section will scroll into
@@ -885,7 +888,7 @@ function CitedReferencesPanel({
       try {
         const fallbackAbsPath = projectAbsolutePath(pp, fallbackPath)
         const content = await readFile(fallbackAbsPath)
-        setPendingScrollImageSrc(firstUrl)
+        if (useWikiStore.getState().project?.path !== project.path) return
         if (onOpenReferencePreview) {
           onOpenReferencePreview({
             title: getFileName(fallbackAbsPath),
@@ -895,6 +898,7 @@ function CitedReferencesPanel({
         } else {
           openFileInPreview(fallbackAbsPath, content)
         }
+        setPendingScrollImageSrc(imageScrollTarget(fallbackAbsPath, firstUrl))
       } catch (err) {
         console.warn(`[refs:image-jump] fallback also failed:`, err)
       }
@@ -1445,7 +1449,7 @@ function MarkdownContent({ content }: { content: string }) {
         style={{ textAlign: "start" }}
       >
         <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkMath]}
+          remarkPlugins={[remarkGfm, remarkMath, remarkCjkFriendly]}
           rehypePlugins={[rehypeKatex]}
           components={{
             a: ({ href, children }) => {

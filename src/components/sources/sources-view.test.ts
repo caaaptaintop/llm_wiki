@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import type { FileNode } from "@/types/wiki"
-import { filterSourceTreeByQuery, summarizeImportOutcome } from "./sources-view"
+import { filterPreparedSourceArtifacts, filterSourceTreeByQuery, summarizeImportOutcome } from "./sources-view"
 
 const TREE: FileNode[] = [
   {
@@ -14,6 +14,55 @@ const TREE: FileNode[] = [
   },
   { name: "notes.txt", path: "/project/raw/sources/notes.txt", is_dir: false },
 ]
+
+describe("filterPreparedSourceArtifacts", () => {
+  const packagePath = `/project/raw/sources/书籍--${"a".repeat(64)}.wiki-source`
+  const file = (path: string): FileNode => ({ name: path.split("/").pop()!, path, is_dir: false })
+  const folder = (path: string, children: FileNode[]): FileNode => ({ name: path.split("/").pop()!, path, is_dir: true, children })
+
+  it("keeps the managed package and source.md while hiding its manifest and asset subtrees without mutation", () => {
+    const source = file(`${packagePath}/source.md`)
+    const tree = [folder("/project/raw/sources/Books", [folder(packagePath, [
+      source,
+      file(`${packagePath}/manifest.json`),
+      folder(`${packagePath}/images`, [file(`${packagePath}/images/cover.jpg`)]),
+      folder(`${packagePath}/assets`, [file(`${packagePath}/assets/source.md`)]),
+    ])])]
+    const original = structuredClone(tree)
+    expect(filterPreparedSourceArtifacts(tree)).toEqual([
+      folder("/project/raw/sources/Books", [folder(packagePath, [source])]),
+    ])
+    expect(tree).toEqual(original)
+  })
+
+  it("preserves ordinary images, JSON and non-managed folders with similar names", () => {
+    const tree = [
+      file("/project/raw/sources/cover.jpg"),
+      file("/project/raw/sources/manifest.json"),
+      folder("/project/raw/sources/draft.wiki-source", [
+        file("/project/raw/sources/draft.wiki-source/manifest.json"),
+        folder("/project/raw/sources/draft.wiki-source/images", [file("/project/raw/sources/draft.wiki-source/images/cover.jpg")]),
+      ]),
+    ]
+    expect(filterPreparedSourceArtifacts(tree)).toEqual(tree)
+  })
+
+  it("prunes managed packages and parent folders left empty after filtering auxiliaries", () => {
+    expect(filterPreparedSourceArtifacts([folder("/project/raw/sources/Books", [folder(packagePath, [
+      file(`${packagePath}/manifest.json`), folder(`${packagePath}/images`, []),
+    ])])])).toEqual([])
+    expect(filterPreparedSourceArtifacts([folder(packagePath, [])])).toEqual([])
+  })
+
+  it("preserves originally empty ordinary directories, including nested and unspecified children", () => {
+    const tree = [
+      folder("/project/raw/sources/Empty", []),
+      folder("/project/raw/sources/Parent", [folder("/project/raw/sources/Parent/Empty", [])]),
+      { name: "Unloaded", path: "/project/raw/sources/Unloaded", is_dir: true },
+    ]
+    expect(filterPreparedSourceArtifacts(tree)).toEqual(tree)
+  })
+})
 
 describe("filterSourceTreeByQuery", () => {
   it("keeps parent folders while removing non-matching siblings", () => {

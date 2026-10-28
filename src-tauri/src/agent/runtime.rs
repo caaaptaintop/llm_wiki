@@ -170,6 +170,15 @@ impl AgentRuntime {
         if message.is_empty() {
             return Err("message is required".to_string());
         }
+        tools::validate_source_scope(&self.project_path, &request.source_paths)?;
+        let source_budget = request.top_k.unwrap_or(DEFAULT_CHAT_SEARCH_RESULTS).clamp(1, MAX_CHAT_SEARCH_RESULTS);
+        if request.source_paths.len() > source_budget {
+            return Err(format!("选择了{}份来源，但当前检索预算为{source_budget}条；请减少来源或增加 topK。", request.source_paths.len()));
+        }
+        if request.retrieval_query.as_ref().is_some_and(|q| q.chars().count() > 2000 || q.trim().is_empty()) {
+            return Err("检索词必须是1至2000字符".into());
+        }
+        let retrieval_query = request.retrieval_query.as_deref().unwrap_or(message);
         validate_images(&request.images)?;
         check_cancel(cancellation.as_ref())?;
 
@@ -246,6 +255,9 @@ impl AgentRuntime {
             .as_ref()
             .is_some_and(|cfg| cfg.is_usable_for_backend_http())
         {
+            if !request.source_paths.is_empty() || request.retrieval_query.is_some() {
+                return Err("显式来源范围与检索计划目前用于 CLI 检索；HTTP 工具循环尚未接入该范围。".into());
+            }
             return self
                 .run_agent_loop(
                     &request,
@@ -310,24 +322,31 @@ impl AgentRuntime {
             &request.tools,
             skills.is_empty(),
         );
-        let should_search_wiki =
-            router.should_search_wiki || planned_has("wiki.search") || fallback_wiki_search;
-        let should_include_sources = router.should_include_sources || planned_has("source.search");
-        let should_search_graph = matches!(router.intent, super::router::QueryIntent::NeedsGraph)
-            || planned_has("graph.search");
-        let should_run_web = request.tools.web
+        // CLI providers use this retrieval preflight rather than the HTTP
+        // tool loop. Honour explicit evidence modes here as well.
+        let faithful = request.retrieval_mode == AgentRetrievalMode::Faithful;
+        let should_search_wiki = !faithful
+            && (router.should_search_wiki || planned_has("wiki.search") || fallback_wiki_search
+                || (request.tools.wiki && request.retrieval_mode == AgentRetrievalMode::Smart));
+        let should_include_sources = request.tools.wiki
+            && (faithful || request.retrieval_mode == AgentRetrievalMode::Smart
+                || router.should_include_sources || planned_has("source.search"));
+        let should_search_graph = request.source_paths.is_empty() && !faithful
+            && (matches!(router.intent, super::router::QueryIntent::NeedsGraph)
+                || planned_has("graph.search"));
+        let should_run_web = request.source_paths.is_empty() && !faithful && request.tools.web
             && (matches!(
                 router.intent,
                 super::router::QueryIntent::NeedsExternalSearch
             ) || planned_has("web.search")
                 || matches!(request.mode, AgentMode::Deep));
-        let should_run_anytxt = request.tools.anytxt
+        let should_run_anytxt = request.source_paths.is_empty() && !faithful && request.tools.anytxt
             && (should_include_sources
                 || planned_has("anytxt.search")
                 || matches!(request.mode, AgentMode::Deep));
         let deep_research = matches!(request.mode, AgentMode::Deep)
             && (should_run_web || should_run_anytxt || should_include_sources);
-        let shell_call = if skills.is_empty() {
+        let shell_call = if faithful || skills.is_empty() {
             None
         } else if let Some(command) = request
             .shell_command
@@ -615,7 +634,7 @@ impl AgentRuntime {
             let wiki_query = planned_queries
                 .get("wiki.search")
                 .map(String::as_str)
-                .unwrap_or(message);
+                .unwrap_or(retrieval_query);
             tool_emit_event(
                 &mut tool_events,
                 &mut events,
@@ -640,6 +659,7 @@ impl AgentRuntime {
                     "wiki.search",
                     serde_json::json!({
                         "query": wiki_query,
+                        "sourcePaths": request.source_paths,
                         "topK": top_k,
                         "includeContent": request.include_content.unwrap_or(false)
                     }),
@@ -655,7 +675,7 @@ impl AgentRuntime {
             match wiki_search {
                 Ok(search) => {
                     check_cancel(cancellation.as_ref())?;
-                    let search_refs = search.references;
+                    let search_refs: Vec<_> = search.references.into_iter().filter(|r| tools::wiki_matches_source_scope(&self.project_path, &r.path, &request.source_paths)).collect();
                     for reference in &search_refs {
                         emit_event(
                             &mut events,
@@ -712,23 +732,27 @@ impl AgentRuntime {
                     );
                 }
             }
-            if matches!(request.mode, AgentMode::Deep) && !references.is_empty() {
+            if (matches!(request.mode, AgentMode::Deep)
+                || request.retrieval_mode == AgentRetrievalMode::Smart) && !references.is_empty() {
                 permission_policy.require(AgentCapability::ReadProject)?;
+                let smart = request.retrieval_mode == AgentRetrievalMode::Smart;
                 let excerpts = references
-                    .iter()
+                    .iter_mut()
                     .filter(|reference| reference.kind == "wiki")
-                    .take(2)
+                    .take(if smart { 3 } else { 2 })
                     .filter_map(|reference| {
                         tools::read_wiki_page(&self.project_path, &reference.path)
                             .ok()
                             .map(|content| {
+                                let excerpt = tools::relevant_wiki_excerpt(&content, retrieval_query, if smart { 4_000 } else { 2_000 });
+                                // CLI completion receives references, not retrieval_parts.
+                                // Forward the bounded page body instead of a metadata-only
+                                // search snippet; faithful never enters this branch.
+                                reference.snippet = Some(excerpt.clone());
                                 format!(
                                     "Excerpt from {}:\n{}",
                                     reference.path,
-                                    collapse_whitespace(&content)
-                                        .chars()
-                                        .take(2_000)
-                                        .collect::<String>()
+                                    excerpt
                                 )
                             })
                     })
@@ -768,7 +792,7 @@ impl AgentRuntime {
             let source_query = planned_queries
                 .get("source.search")
                 .map(String::as_str)
-                .unwrap_or(message);
+                .unwrap_or(retrieval_query);
             tool_emit_event(
                 &mut tool_events,
                 &mut events,
@@ -789,6 +813,7 @@ impl AgentRuntime {
                     "source.search",
                     serde_json::json!({
                         "query": source_query,
+                        "sourcePaths": request.source_paths,
                         "topK": request
                             .top_k
                             .unwrap_or(DEFAULT_CHAT_SEARCH_RESULTS)
@@ -5793,6 +5818,91 @@ mod tests {
             answer_without_backend_generator("hello", &[], true).unwrap(),
             ""
         );
+    }
+
+    #[tokio::test]
+    async fn cli_preflight_honours_source_modes_without_a_http_generator() {
+        let project = temp_project("cli-source-modes");
+        fs::create_dir_all(project.join("raw/sources")).unwrap();
+        fs::write(project.join("raw/sources/guide.md"), "# Draft\n\nneedle original evidence, not a field validation.").unwrap();
+        fs::write(project.join("wiki/concepts/claim.md"), format!("---\ntitle: Claim\n---\n# Claim\n\nneedle unsupported generated claim.\n\n{}\n\nAdditional body evidence after the short search snippet.\n\n{}\nTAIL_OUTSIDE_BUDGET",
+            "surrounding context ".repeat(40), "bounded excerpt ".repeat(400))).unwrap();
+        let config: LlmConfig = serde_json::from_value(serde_json::json!({"provider":"codex-cli", "model":"gpt-6.1-sol"})).unwrap();
+        let runtime = AgentRuntime::new("test", project.to_string_lossy(), None, Some(config), None, None);
+        for mode in [AgentRetrievalMode::Standard, AgentRetrievalMode::Smart, AgentRetrievalMode::Faithful] {
+            let response = runtime.run_once(AgentChatRequest {
+                message: "needle".into(), retrieval_mode: mode,
+                persist_session: false, allow_empty_retrieval: true,
+                tools: AgentToolOptions { wiki: true, web: true, anytxt: true },
+                ..Default::default()
+            }).await.unwrap();
+            let has_source = response.references.iter().any(|r| r.kind == "source");
+            assert_eq!(has_source, mode != AgentRetrievalMode::Standard);
+            if mode == AgentRetrievalMode::Smart {
+                let excerpt = response.references.iter().find(|r| r.kind == "wiki").unwrap().snippet.as_ref().unwrap();
+                assert!(excerpt.contains("Additional body evidence"));
+                assert!(!excerpt.contains("title: Claim"));
+                assert!(excerpt.chars().count() <= 4_003);
+                assert!(!excerpt.contains("TAIL_OUTSIDE_BUDGET"));
+                assert!(response.message.contains("Additional body evidence"));
+            }
+            if mode == AgentRetrievalMode::Standard {
+                assert!(!response.message.contains("Additional body evidence"));
+            }
+            if mode == AgentRetrievalMode::Faithful {
+                assert!(response.references.iter().all(|r| r.kind == "source"));
+                assert!(!response.message.contains("unsupported generated claim"));
+                assert!(!response.tool_events.iter().any(|e| ["wiki.search", "graph.search", "web.search", "anytxt.search"].contains(&e.tool.as_str())));
+            }
+        }
+        let disabled = runtime.run_once(AgentChatRequest {
+            message: "needle".into(), retrieval_mode: AgentRetrievalMode::Faithful,
+            tools: AgentToolOptions { wiki: false, web: false, anytxt: false },
+            allow_empty_retrieval: true, persist_session: false, ..Default::default()
+        }).await.unwrap();
+        assert!(disabled.references.is_empty());
+        fs::create_dir_all(project.join(".llm-wiki/skills/example")).unwrap();
+        fs::write(project.join(".llm-wiki/skills/example/SKILL.md"), "---\nname: example\ndescription: Example\n---\nRead the provided evidence.").unwrap();
+        for (mode, skills) in [(AgentMode::Fast, vec![]), (AgentMode::Standard, vec!["example".to_string()])] {
+            let response = runtime.run_once(AgentChatRequest {
+                message: "needle".into(), mode, skills,
+                retrieval_mode: AgentRetrievalMode::Smart,
+                allow_empty_retrieval: true, persist_session: false, ..Default::default()
+            }).await.unwrap();
+            for tool in ["wiki.search", "source.search"] {
+                assert_eq!(response.tool_events.iter().filter(|event| event.tool == tool && event.status == "completed").count(), 1);
+            }
+            assert!(response.references.iter().any(|r| r.kind == "wiki"));
+            assert!(response.references.iter().any(|r| r.kind == "source"));
+        }
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_scope_filters_wiki_before_top_k_and_excludes_mixed_pages() {
+        let project = temp_project("cli-source-scope");
+        fs::create_dir_all(project.join("raw/sources")).unwrap();
+        fs::write(project.join("raw/sources/selected.md"), "needle scoped evidence.").unwrap();
+        fs::write(project.join("raw/sources/outside.md"), "needle unrelated result.").unwrap();
+        for i in 0..12 {
+            fs::write(project.join(format!("wiki/concepts/a{i}.md")), "---\ntitle: needle\nsources: [outside.md]\n---\nneedle needle needle needle\n").unwrap();
+        }
+        fs::write(project.join("wiki/concepts/mixed.md"), "---\ntitle: needle\nsources: [selected.md, outside.md]\n---\nneedle mixed unsupported scope.\n").unwrap();
+        fs::write(project.join("wiki/concepts/selected.md"), "---\ntitle: Selected\nsources: [selected.md]\n---\nneedle scoped body.\n").unwrap();
+        let config: LlmConfig = serde_json::from_value(serde_json::json!({"provider":"codex-cli","model":"gpt-6.1-terra"})).unwrap();
+        let runtime = AgentRuntime::new("test", project.to_string_lossy(), None, Some(config), None, None);
+        let response = runtime.run_once(AgentChatRequest {
+            message: "中文问题".into(), retrieval_query: Some("needle".into()),
+            source_paths: vec!["raw/sources/selected.md".into()], top_k: Some(1),
+            retrieval_mode: AgentRetrievalMode::Smart,
+            allow_empty_retrieval: true, persist_session: false, ..Default::default()
+        }).await.unwrap();
+        assert!(response.references.iter().any(|r| r.path == "wiki/concepts/selected.md"));
+        assert!(response.references.iter().any(|r| r.path == "raw/sources/selected.md"));
+        assert!(!response.message.contains("outside.md"));
+        assert!(!response.message.contains("mixed.md"));
+        assert!(response.references.iter().all(|r| r.knowledge_context.is_none()));
+        fs::remove_dir_all(project).unwrap();
     }
 
     #[test]

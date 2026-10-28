@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import fs from "node:fs/promises"
 import path from "node:path"
+import { createHash } from "node:crypto"
 import { createTempProject, realFs, writeFileRaw } from "@/test-helpers/fs-temp"
 import { useActivityStore } from "@/stores/activity-store"
 import { useChatStore } from "@/stores/chat-store"
@@ -8,8 +9,12 @@ import { useReviewStore } from "@/stores/review-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { sourceSummarySlugFromIdentity } from "./source-identity"
 import { migrateSourcePath } from "./source-lifecycle"
+import { parseSources } from "./sources-merge"
 
 vi.mock("@/commands/fs", () => realFs)
+// This suite pins source routing and the original analysis/generation resume.
+// The additive coverage stage has its own real-filesystem validation suite.
+vi.mock("./section-knowledge", () => ({ ensureSectionKnowledge: async () => [] }))
 
 let sourceMarkers: string[] = []
 let failLongChunksOnce = new Set<number>()
@@ -29,10 +34,10 @@ vi.mock("./llm-client", () => ({
     const systemPrompt = String(messages?.[0]?.content ?? "")
     const userPrompt = String(messages?.[1]?.content ?? "")
 
-    if (systemPrompt.startsWith("You are merging two versions")) {
+    if (systemPrompt.startsWith("You are merging source-backed material")) {
       mergeRequestCount++
-      const incoming = userPrompt.split("## Newly generated version")[1]?.split("---")[2]
-      cb.onToken(incoming?.trim() || "---\ntitle: merged\n---\n\n# merged")
+      const incoming = userPrompt.match(/## Additional material[^\n]*\n\n([\s\S]*?)\n\n---\n\nNow output/)?.[1]
+      cb.onToken(`---FILE: wiki/merged-page.md---\n${incoming?.trim() || "---\ntitle: merged\n---\n\n# merged"}\n---END FILE---`)
       cb.onDone()
       return
     }
@@ -77,6 +82,7 @@ vi.mock("./llm-client", () => ({
         "",
         "## Updated Global Digest",
         `Digest after chunk ${chunkIndex}: stable context ${chunkIndex}.`,
+        "---END LONG SOURCE ANALYSIS---",
       ].join("\n"))
       cb.onDone()
       return
@@ -262,6 +268,50 @@ describe("autoIngest source summary paths", () => {
     const content = buildFallbackSourceSummary("long.md", analysis, "2026-07-11")
     expect(content).toContain(analysis)
     expect(content).toContain("-end")
+  })
+
+  it.each(["automatic", "interactive"])("rejects nonexistent generated package references in %s writes", async (mode) => {
+    if (!tmp) throw new Error("missing temp project")
+    const valid = `other--${"b".repeat(64)}.wiki-source/source.md`
+    const invalid = `other--${"b".repeat(67)}.wiki-source/source.md`
+    await writeFileRaw(`${tmp.path}/raw/sources/${valid}`, "# Other source")
+    const pagePath = "wiki/concepts/package-reference.md"
+    const block = `---FILE: ${pagePath}---\n---\ntype: concept\ntitle: Package reference\nsources: ["${valid}", "${invalid}"]\n---\n# Package reference\n\nSupported text.\n---END FILE---`
+    if (mode === "automatic") {
+      generationPrefix = block
+      await autoIngest(tmp.path, `${tmp.path}/raw/sources/project-a/config.yaml`, useWikiStore.getState().llmConfig)
+    } else {
+      useChatStore.getState().createConversation()
+      useChatStore.setState({ ingestSource: `${tmp.path}/raw/sources/project-a/config.yaml` })
+      interactiveGenerationOverride = block
+      await executeIngestWrites(tmp.path, useWikiStore.getState().llmConfig)
+    }
+    const content = await fs.readFile(`${tmp.path}/${pagePath}`, "utf8")
+    expect(parseSources(content)).toEqual([valid, "project-a/config.yaml"])
+    expect(content).toContain("Supported text.")
+    expect(await fs.readFile(`${tmp.path}/.llm-wiki/ingest-warnings.log`, "utf8")).toContain(invalid)
+  })
+
+  it.each(["automatic", "interactive"])("preserves historical package provenance in %s writes while rejecting new fabricated references", async (mode) => {
+    if (!tmp) throw new Error("missing temp project")
+    const historical = `archived--${"a".repeat(64)}.wiki-source/source.md`
+    const invalid = `invented--${"c".repeat(64)}.wiki-source/source.md`
+    const pagePath = "wiki/concepts/history.md"
+    await writeFileRaw(`${tmp.path}/${pagePath}`, `---\ntype: concept\ntitle: History\nsources: ["${historical}"]\n---\n# History\n\nExisting evidence.`)
+    const block = `---FILE: ${pagePath}---\n---\ntype: concept\ntitle: History\nsources: ["${invalid}", "${historical}"]\n---\n# History\n\nExisting evidence with an additional finding.\n---END FILE---`
+    if (mode === "automatic") {
+      generationPrefix = block
+      await autoIngest(tmp.path, `${tmp.path}/raw/sources/project-a/config.yaml`, useWikiStore.getState().llmConfig)
+    } else {
+      useChatStore.getState().createConversation()
+      useChatStore.setState({ ingestSource: `${tmp.path}/raw/sources/project-a/config.yaml` })
+      interactiveGenerationOverride = block
+      await executeIngestWrites(tmp.path, useWikiStore.getState().llmConfig)
+    }
+    const sources = parseSources(await fs.readFile(`${tmp.path}/${pagePath}`, "utf8"))
+    expect(sources).toContain(historical)
+    expect(sources).toContain("project-a/config.yaml")
+    expect(sources).not.toContain(invalid)
   })
 
   it.each(["before", "after"])("preserves the exact summary when a cited work appears %s it", async (order) => {
@@ -605,6 +655,44 @@ describe("autoIngest source summary paths", () => {
     expect(await fs.readFile(canonicalSummaryPath, "utf8")).toContain("project-a config")
   })
 
+  it("processes a prepared book by chapter below the single-pass limit and resumes only a matching plan", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["prepared book"]
+    const source = `## 第一章 设计\n\n${"设计证据。".repeat(1800)}\n\n## 第二章 施工\n\n${"施工证据。".repeat(1800)}`
+    const sha = (text: string) => createHash("sha256").update(text).digest("hex")
+    const manifest = JSON.stringify({ version: 1, source: { filename: "source.md", sha256: sha(source) }, images: [] })
+    const dir = `${tmp.path}/raw/sources/book--${sha(manifest)}.wiki-source`
+    await writeFileRaw(`${dir}/source.md`, source)
+    await writeFileRaw(`${dir}/manifest.json`, manifest)
+    const config = { ...useWikiStore.getState().llmConfig, maxContextSize: 524_288 }
+    failLongChunksOnce = new Set([2])
+    await expect(autoIngest(tmp.path, `${dir}/source.md`, config)).rejects.toThrow("Chunk analysis stream failed")
+    const chunkCalls = () => mockStreamChat.mock.calls.filter(([, messages]) => String(messages?.[0]?.content ?? "").startsWith("You are analyzing a long source document"))
+    expect(chunkCalls()).toHaveLength(2)
+    const first = String(chunkCalls()[0][1]?.[1]?.content)
+    expect(first).toContain("Prepared chapter: 第一章 设计")
+    expect(first).not.toContain("施工证据")
+    const progressDir = `${tmp.path}/.llm-wiki/ingest-progress`
+    const checkpointPath = `${progressDir}/${(await fs.readdir(progressDir))[0]}`
+    const saved = JSON.parse(await fs.readFile(checkpointPath, "utf8"))
+    expect(saved.chunkPlanHash).toMatch(/^[a-f0-9]{16}$/)
+
+    // A changed partition must not reuse the same chunk count's old notes.
+    await fs.writeFile(checkpointPath, JSON.stringify({ ...saved, chunkPlanHash: "old-plan" }))
+    failLongChunksOnce = new Set([2])
+    mockStreamChat.mockClear()
+    await expect(autoIngest(tmp.path, `${dir}/source.md`, config)).rejects.toThrow("Chunk analysis stream failed")
+    expect(String(chunkCalls()[0][1]?.[1]?.content)).toContain("Chunk: 1/2")
+
+    mockStreamChat.mockClear()
+    await autoIngest(tmp.path, `${dir}/source.md`, config)
+    expect(chunkCalls()).toHaveLength(1)
+    expect(String(chunkCalls()[0][1]?.[1]?.content)).toContain("Chunk: 2/2")
+    const generation = mockStreamChat.mock.calls.find(([, messages]) => String(messages?.[0]?.content ?? "").includes("Based on the analysis provided, generate wiki files"))
+    expect(String(generation?.[1]?.[1]?.content)).toContain("## Chapter coverage\n- 第一章 设计\n- 第二章 施工")
+    expect(String(generation?.[1]?.[1]?.content)).not.toContain("设计证据。".repeat(100))
+  })
+
   it("analyzes oversized sources in chunks before final wiki generation", async () => {
     if (!tmp) throw new Error("missing temp project")
     sourceMarkers = ["long source"]
@@ -792,6 +880,26 @@ describe("autoIngest source summary paths", () => {
       title: "Real Follow-up",
     })
     expect(reviews[0].description).not.toContain("Truncated Orphan")
+  })
+
+  it("resolves a truncated structural log with the deterministic fallback and caches the completed source", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    generationSuffix = "---FILE: wiki/log.md---\n## Incomplete log entry"
+    const source = `${tmp.path}/raw/sources/project-a/config.yaml`
+    const written = await autoIngest(tmp.path, source, useWikiStore.getState().llmConfig)
+    expect(written).toContain("wiki/log.md")
+    expect(await fs.readFile(`${tmp.path}/wiki/log.md`, "utf8")).toContain("ingest | project-a/config.yaml")
+    expect(mockStreamChat.mock.calls.some(([, messages]) => String(messages[0]?.content).startsWith("You are repairing truncated wiki FILE blocks"))).toBe(false)
+    const calls = mockStreamChat.mock.calls.length
+    await autoIngest(tmp.path, source, useWikiStore.getState().llmConfig)
+    expect(mockStreamChat).toHaveBeenCalledTimes(calls)
+  })
+
+  it("still fails if a truncated structural log cannot be written", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    generationSuffix = "---FILE: wiki/log.md---\n## Incomplete log entry"
+    await fs.mkdir(`${tmp.path}/wiki/log.md`)
+    await expect(autoIngest(tmp.path, `${tmp.path}/raw/sources/project-a/config.yaml`, useWikiStore.getState().llmConfig)).rejects.toThrow("truncated wiki file")
   })
 
   it("retries a truncated FILE block with a targeted generation request", async () => {

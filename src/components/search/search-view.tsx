@@ -6,7 +6,8 @@ import { searchWiki, tokenizeQuery, type SearchResult, type ImageRef } from "@/l
 import { useTranslation } from "react-i18next"
 import { normalizePath } from "@/lib/path-utils"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
-import { findRawSourceForImage, imageUrlToAbsolute } from "@/lib/raw-source-resolver"
+import { findRawSourceImageTarget } from "@/lib/raw-source-resolver"
+import { imageScrollTarget } from "@/lib/reader-image-navigation"
 import { isImeComposing } from "@/lib/keyboard-utils"
 
 /**
@@ -130,21 +131,9 @@ export function SearchView() {
    * click a search-result image is "show me where this came
    * from in the actual document," and that's the raw file.
    *
-   * Path derivation: image URLs always live under
-   * `<project>/wiki/media/<slug>/img-N.<ext>`. The slug matches
-   * the basename of the original raw source (we wrote it that
-   * way at extraction time in extract_pdf_markdown / fs.rs's
-   * raw-sources-layout heuristic). We list `raw/sources/` once
-   * and pick the file whose stem equals the slug.
-   *
-   * The raw file's preview goes through `read_file` → the
-   * combined-extraction path (text + per-page image refs with
-   * absolute URLs), which means the `<img data-mdsrc=...>` we
-   * scroll-target lives in the same DOM. To match what the
-   * preview emits, we normalize `hit.url` to its absolute form
-   * before staging the pending scroll — wiki-relative URLs
-   * (from the safety-net section) wouldn't otherwise match the
-   * absolute URLs the raw extractor uses.
+   * Resolve source identity plus the actual source image reference together.
+   * Markdown copies require a byte-verified mapping back to images/...;
+   * binary source previews retain the extractor's absolute media reference.
    *
    * Fallback: if we can't find a raw source file (e.g. the user
    * deleted it after ingest, leaving only the wiki summary), we
@@ -153,26 +142,20 @@ export function SearchView() {
   async function handleJumpFromLightbox(hit: ImageHit) {
     const projectPath = project?.path
     let openPath = hit.sourcePath
-    let scrollTarget = hit.url
-
-    if (projectPath) {
-      const pp = normalizePath(projectPath)
-      const rawPath = await findRawSourceForImage(hit.url, pp)
-      if (rawPath) {
-        console.log(`[search:jump] ${hit.url} → raw source ${rawPath}`)
-        openPath = rawPath
-        scrollTarget = imageUrlToAbsolute(scrollTarget, pp)
-      } else {
-        console.warn(
-          `[search:jump] no raw source found for image ${hit.url} — falling back to wiki page`,
-        )
-      }
-    }
+    let scrollTarget: string | null = hit.url
 
     try {
+      if (projectPath) {
+        const raw = await findRawSourceImageTarget(hit.url, normalizePath(projectPath))
+        if (raw) {
+          openPath = raw.path
+          scrollTarget = raw.imageSrc
+        }
+      }
       const content = await readFile(openPath)
-      setPendingScrollImageSrc(scrollTarget)
+      if (useWikiStore.getState().project?.path !== projectPath) return
       openFileInPreview(openPath, content)
+      setPendingScrollImageSrc(imageScrollTarget(openPath, scrollTarget))
       setLightbox(null)
     } catch (err) {
       console.error("Failed to jump to source:", err)

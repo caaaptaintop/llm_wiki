@@ -13,6 +13,7 @@ describe("wiki preview store actions", () => {
       previewReturnView: null,
       previewBackStack: [],
       previewForwardStack: [],
+      pendingScrollHeading: null,
     })
   })
 
@@ -152,6 +153,41 @@ describe("wiki preview store actions", () => {
     expect(state.fileContent).toBe("# Page")
     expect(state.previewContentPath).toBe("/project/wiki/page.md")
     expect(state.externalPreview).toBeNull()
+  })
+
+  it("atomically opens the target page with its pending evidence heading", () => {
+    useWikiStore.getState().openPathInPreview("/project/wiki/chapter.md", "chapter-p1-e1")
+    expect(useWikiStore.getState().selectedFile).toBe("/project/wiki/chapter.md")
+    expect(useWikiStore.getState().pendingScrollHeading).toEqual({ path: "/project/wiki/chapter.md", anchor: "chapter-p1-e1" })
+    useWikiStore.getState().setPendingScrollHeading(null)
+    expect(useWikiStore.getState().pendingScrollHeading).toBeNull()
+  })
+
+  it("drops a pending heading when opening another file or closing the preview", () => {
+    const store = useWikiStore.getState()
+    store.openPathInPreview("/project/wiki/a.md", "evidence")
+    store.openPathInPreview("/project/wiki/b.md")
+    expect(useWikiStore.getState().pendingScrollHeading).toBeNull()
+    store.openPathInPreview("/project/wiki/a.md", "evidence")
+    store.closePreview()
+    expect(useWikiStore.getState().pendingScrollHeading).toBeNull()
+  })
+
+  it("does not carry a heading request across history navigation, view changes or projects", () => {
+    const store = useWikiStore.getState()
+    store.openPathInPreview("/project/wiki/a.md")
+    store.openPathInPreview("/project/wiki/b.md", "evidence")
+    store.navigatePreviewBack()
+    expect(useWikiStore.getState().pendingScrollHeading).toBeNull()
+    store.setPendingScrollHeading({ path: "/project/wiki/a.md", anchor: "evidence" })
+    store.navigatePreviewForward()
+    expect(useWikiStore.getState().pendingScrollHeading).toBeNull()
+    store.openPathInPreview("/project/wiki/b.md", "evidence")
+    store.setActiveView("books")
+    expect(useWikiStore.getState().pendingScrollHeading).toBeNull()
+    store.openPathInPreview("/project/wiki/a.md", "evidence")
+    store.setProject({ id: "other", name: "Other", path: "/other" })
+    expect(useWikiStore.getState().pendingScrollHeading).toBeNull()
   })
 
   it("returns to the originating sources view when closing a preview", () => {

@@ -7,6 +7,7 @@ import {
   readFile,
   readFileAsBase64,
   writeFile,
+  writeSourceImagesIfUnchanged,
   listDirectory,
 } from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
@@ -28,6 +29,10 @@ import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import { sanitizeIngestedFileContent } from "@/lib/ingest-sanitize"
 import { mergePageContent, type MergeFn } from "@/lib/page-merge"
 import { withProjectLock } from "@/lib/project-mutex"
+import { validatePreparedSource } from "@/lib/prepared-source"
+import { planPreparedBook, type PreparedBookPart } from "@/lib/prepared-book-plan"
+import { ensureSectionKnowledge } from "@/lib/section-knowledge"
+import { resolveSourceMarkdownImage } from "@/lib/raw-source-resolver"
 import { parseFrontmatter } from "@/lib/frontmatter"
 import { makeQuerySlug } from "@/lib/wiki-filename"
 import type { FileNode } from "@/types/wiki"
@@ -35,12 +40,15 @@ import {
   extractAndSaveSourceImages,
   extractAndSaveMarkdownImages,
   buildImageMarkdownSection,
+  findLocalMarkdownImageRefs,
   type SavedImage,
+  type ImageSourceEvidence,
 } from "@/lib/extract-source-images"
 import {
   captionMarkdownImages,
   loadCaptionCache,
   stripMarkdownImageReferences,
+  type CaptionPipelineResult,
 } from "@/lib/image-caption-pipeline"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
@@ -53,6 +61,11 @@ const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
 const LONG_SOURCE_CHUNK_MIN = 12_000
 const LONG_SOURCE_CHUNK_MAX = 60_000
+
+export function formatImageCaptionResult(result: CaptionPipelineResult): string {
+  const ready = result.freshCaptions + result.cachedCaptions
+  return `图片描述：${ready} 项可用（复用 ${result.cachedCaptions} 项）${result.failed ? `，${result.failed} 项未完成，可继续重试` : ""}`
+}
 const LONG_SOURCE_DIGEST_MAX = 15_000
 const LONG_SOURCE_CHUNK_ANALYSIS_MAX = 40_000
 const INGEST_GENERATION_TOKENS_DEFAULT = 8_192
@@ -305,6 +318,7 @@ interface SourceChunk {
   headingPath: string
   overlapBefore: string
   main: string
+  chapter?: Pick<PreparedBookPart, "chapterId" | "chapterTitle" | "chapterKind" | "sectionTitles" | "part" | "parts">
 }
 
 interface LongSourcePlan {
@@ -316,6 +330,7 @@ interface LongSourcePlan {
 
 interface LongSourceCheckpoint {
   version: 1
+  analysisFormatVersion?: 1
   sourceIdentity: string
   sourceHash: string
   sourceLength: number
@@ -323,6 +338,7 @@ interface LongSourceCheckpoint {
   targetChars: number
   overlapChars: number
   chunkTotal: number
+  chunkPlanHash?: string
   completedThrough: number
   globalDigest: string
   analyses: string[]
@@ -334,6 +350,7 @@ interface GenerationCheckpoint {
   sourceIdentity: string
   sourceFingerprint: string
   completedPaths: string[]
+  generationComplete?: boolean
   updatedAt: number
 }
 
@@ -559,6 +576,9 @@ export function parseFileBlocks(text: string): ParseFileBlocksResult {
         i++
         break
       }
+      // A new file cannot be part of an unclosed draft. Leave its opener
+      // for the outer scanner, and report the preceding draft as truncated.
+      if (fenceMarker === null && OPENER_LINE.test(line)) break
 
       contentLines.push(line)
       i++
@@ -568,7 +588,8 @@ export function parseFileBlocks(text: string): ParseFileBlocksResult {
       // H2 fix (partial): we can't fabricate content the LLM never
       // sent, but we surface the drop instead of silently hiding it.
       const pathLabel = path || "(unnamed)"
-      const msg = `FILE block "${pathLabel}" was not closed before end of stream — likely truncation (model hit max_tokens, timeout, or connection dropped). Block dropped.`
+      const boundary = i < lines.length ? "the next FILE block" : "end of stream"
+      const msg = `FILE block "${pathLabel}" was not closed before ${boundary} — likely truncation (model hit max_tokens, timeout, or connection dropped). Block dropped.`
       console.warn(`[ingest] ${msg}`)
       warnings.push(msg)
       if (isSafeIngestPath(path)) truncatedPaths.push(path)
@@ -616,7 +637,11 @@ export function languageRule(sourceContent: string = ""): string {
  */
 export type IngestCommitRunner = <T>(operation: () => Promise<T>) => Promise<T>
 
+export type IngestMode = "full" | "images-only"
+
 export interface AutoIngestOptions {
+  /** Explicit recovery mode; never falls back to text ingestion. */
+  mode?: IngestMode
   /**
    * Adds queue ordering around a commit. The supplied runner must not acquire
    * the project mutex; autoIngest always acquires it inside this callback.
@@ -637,15 +662,18 @@ export async function autoIngest(
   const sp = normalizePath(sourcePath)
   return withProjectLock(
     `ingest-source\0${pp}\0${sp}`,
-    () => autoIngestImpl(
-      projectPath,
-      sourcePath,
-      llmConfig,
-      signal,
-      folderContext,
-      onFileWritten,
-      options,
-    ),
+    async () => {
+      await validatePreparedSource(sp)
+      return autoIngestImpl(
+        projectPath,
+        sourcePath,
+        llmConfig,
+        signal,
+        folderContext,
+        onFileWritten,
+        options,
+      )
+    },
   )
 }
 
@@ -718,8 +746,13 @@ async function autoIngestImpl(
   const activity = useActivityStore.getState()
   const fileName = getFileName(sp)
   const sourceIdentity = sourceIdentityForPath(pp, sp)
+  // The original cache identity is relative to raw/sources. Knowledge evidence
+  // uses the full project-relative path so it can reopen the exact source.
+  const knowledgeSourceIdentity = sp.startsWith(`${pp}/`) ? sp.slice(pp.length + 1) : sourceIdentity
   const sourceSummarySlug = sourceSummarySlugFromIdentity(sourceIdentity)
   const sourceSummaryPath = `wiki/sources/${sourceSummarySlug}.md`
+  const imagesOnly = options?.mode === "images-only"
+  let imageDetail = ""
   const queueCommit = options?.runCommit
   const runCommit: IngestCommitRunner = queueCommit
     ? ((operation) => queueCommit(() => withProjectLock(pp, operation)))
@@ -727,11 +760,19 @@ async function autoIngestImpl(
   console.log(`[ingest:diag] autoIngestImpl ENTRY for "${fileName}" (project="${pp}", source="${sp}")`)
   const activityId = activity.addItem({
     type: "ingest",
-    title: fileName,
+    title: imagesOnly ? `${fileName} · 仅补充图片` : fileName,
     status: "running",
     detail: "Reading source...",
     filesWritten: [],
   })
+
+  const failImagesOnly = (message: string, nonRetryable = false): never => {
+    activity.updateItem(activityId, { status: "error", detail: `仅补充图片失败：${message}；正文未重写，文字覆盖未核验` })
+    throw Object.assign(new Error(message), { nonRetryable })
+  }
+  if (imagesOnly && !useWikiStore.getState().multimodalConfig.enabled) {
+    failImagesOnly("图片描述已关闭，请开启后重试", true)
+  }
 
   // ── MinerU preprocessing for PDF files ──
   const lowerExt = fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() : ""
@@ -740,7 +781,7 @@ async function autoIngestImpl(
   let mineruSucceeded = false
   let mineruSavedImages: SavedImage[] = []
   const mineruConfigured = mineruCfg.backend === "local" || Boolean(mineruCfg.token)
-  if (isPdf && mineruCfg.enabled && mineruConfigured) {
+  if (!imagesOnly && isPdf && mineruCfg.enabled && mineruConfigured) {
     try {
       const cacheDir = sp.substring(0, sp.lastIndexOf("/"))
       const cachePath = `${cacheDir}/.cache/${fileName}.txt`
@@ -777,13 +818,13 @@ async function autoIngestImpl(
   }
 
   const [sourceContent, schema, purpose, index, overview] = await Promise.all([
-    tryReadSourceTextFile(sp),
+    imagesOnly ? readFile(sp, { extractImages: false }).catch(() => failImagesOnly("无法读取当前来源以核对入库缓存", true)) : tryReadSourceTextFile(sp),
     tryReadFile(`${pp}/schema.md`),
     tryReadFile(`${pp}/purpose.md`),
     tryReadFile(`${pp}/wiki/index.md`),
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
-  if (useWikiStore.getState().sourceWatchConfig.persistExtractedMarkdown) {
+  if (!imagesOnly && useWikiStore.getState().sourceWatchConfig.persistExtractedMarkdown) {
     try {
       await persistParsedMarkdown(pp, sp, sourceContent)
     } catch (err) {
@@ -815,16 +856,31 @@ async function autoIngestImpl(
   // of when the file was first ingested.
   const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent)
   console.log(`[ingest:diag] cache check for "${sourceIdentity}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
+  if (imagesOnly && (cachedFiles === null || cachedFiles.length === 0)) {
+    failImagesOnly("当前来源没有匹配的入库缓存；请核对来源后使用全文处理，未降级完整入库", true)
+  }
   if (cachedFiles !== null) {
     return runCommit(async () => {
       throwIfIngestAborted(signal, activityId)
       try {
+      // Recheck after waiting for the ordered commit turn. Never supplement a
+      // changed source using an earlier cache decision.
+      if (imagesOnly) {
+        const currentContent = await readFile(sp, { extractImages: false })
+        if (currentContent !== sourceContent || await checkIngestCache(pp, sourceIdentity, currentContent) === null) {
+          failImagesOnly("等待期间来源或入库缓存已变更，请刷新后重试", true)
+        }
+        if (!useWikiStore.getState().multimodalConfig.enabled) failImagesOnly("图片描述已关闭", true)
+      }
       console.log(`[ingest:diag] cache-hit branch: starting image extraction for ${sp}`)
       const skipNativePdfImageExtraction = isPdf && hasMineruImageRefs(sourceContent, sourceSummarySlug)
       let savedImages = skipNativePdfImageExtraction
         ? mineruSavedImages
         : await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
       const markdownImages = await extractAndSaveMarkdownImages(pp, sp, sourceContent, sourceSummarySlug)
+      if (imagesOnly && markdownImages.length !== findLocalMarkdownImageRefs(sourceContent).length) {
+        failImagesOnly("部分来源图片未能提取，请检查图片文件后重试")
+      }
       savedImages = [...savedImages, ...markdownImages]
       console.log(`[ingest:diag] cache-hit branch: got ${savedImages.length} image(s)`)
       if (savedImages.length > 0) {
@@ -846,14 +902,17 @@ async function autoIngestImpl(
         // to start clean.)
         const mmCfg = useWikiStore.getState().multimodalConfig
         if (!mmCfg.enabled) {
+          if (imagesOnly) failImagesOnly("图片描述已关闭", true)
+          imageDetail = `图片描述未启用；已提取 ${savedImages.length} 张图片`
           console.log(
             `[ingest:caption] cache-hit + disabled — skipping caption + safety-net inject (${savedImages.length} image(s) untouched on disk)`,
           )
         } else {
           const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
+          if (imagesOnly && !captionLlm) failImagesOnly("图片描述模型未配置", true)
           if (captionLlm) {
             try {
-              await withProjectLock(`${pp}\0image-caption-cache`, () =>
+              const captionResult = await withProjectLock(`${pp}\0image-caption-cache`, () =>
                 captionMarkdownImages(pp, appendSavedImageRefsForCaption(sourceContent, savedImages), captionLlm, {
                   signal,
                   shouldCaption: (url) =>
@@ -867,19 +926,33 @@ async function autoIngestImpl(
                     }),
                 }),
               )
+              imageDetail = formatImageCaptionResult(captionResult)
+              if (imagesOnly && (captionResult.failed > 0 || captionResult.freshCaptions + captionResult.cachedCaptions === 0)) {
+                failImagesOnly(imageDetail)
+              }
+              if (imagesOnly) {
+                const persistedCaptions = await loadCaptionCache(pp, getLanguagePromptName(getOutputLanguage(sourceContent)))
+                if (savedImages.some(image => !persistedCaptions.get(image.sha256)?.trim())) {
+                  failImagesOnly("部分图片没有可用的描述缓存，停止发布图片区，可重试")
+                }
+              }
             } catch (err) {
+              if (imagesOnly) throw err
+              imageDetail = "图片描述未完成，可查看活动记录后重试"
               console.warn(
                 `[ingest:caption] cache-hit caption pass failed:`,
                 err instanceof Error ? err.message : err,
               )
             }
           }
+          throwIfIngestAborted(signal, activityId)
           await injectImagesIntoSourceSummary(
             pp,
             sourceIdentity,
             sourceSummarySlug,
             savedImages,
             getLanguagePromptName(getOutputLanguage(sourceContent)),
+            imagesOnly ? { strict: true, signal } : undefined,
           )
           // Re-embed the source-summary page so caption text lands
           // in the search index. Without this step, search by image
@@ -890,20 +963,53 @@ async function autoIngestImpl(
           await reembedSourceSummary(pp, sourceIdentity, sourceSummarySlug)
         }
       } else {
+        if (imagesOnly) failImagesOnly("未找到可补充的图片，请检查来源与图片提取结果", true)
         console.log(`[ingest:diag] cache-hit branch: skipping injection (no images returned from extraction)`)
       }
       } catch (err) {
+        if (imagesOnly) {
+          throwIfIngestAborted(signal, activityId)
+          const message = err instanceof Error ? err.message : String(err)
+          const nonRetryable = err instanceof Error && "nonRetryable" in err && err.nonRetryable === true
+          failImagesOnly(message, nonRetryable)
+        }
+        imageDetail = "图片处理未完成，可查看活动记录后重试"
         console.warn(
           `[ingest:images] cache-hit injection failed for "${fileName}":`,
           err instanceof Error ? err.message : err,
         )
       }
+      throwIfIngestAborted(signal, activityId)
+      if (imagesOnly) {
+        const imagePaths = [sourceSummaryPath]
+        onFileWritten?.(sourceSummaryPath)
+        await refreshProjectFileTree(pp, { bumpDataVersion: true })
+        activity.updateItem(activityId, {
+          status: "done",
+          detail: `仅补充图片完成；${imageDetail}；正文未重写，文字覆盖未核验`,
+          filesWritten: imagePaths,
+        })
+        return imagePaths
+      }
+      const knowledgePaths = await ensureSectionKnowledge({
+        projectPath: pp, sourceIdentity: knowledgeSourceIdentity, sourceContent, schema, config: llmConfig, signal,
+        onProgress: detail => activity.updateItem(activityId, { detail }),
+      })
+      const completePaths = uniqueNormalizedPaths([...cachedFiles, ...knowledgePaths])
+      if (knowledgePaths.length) {
+        await updateWikiIndexDeterministically(pp, knowledgePaths)
+        await updateWikiOverviewDeterministically(pp, knowledgePaths)
+        await saveIngestCache(pp, sourceIdentity, sourceContent, completePaths)
+        await refreshProjectFileTree(pp, { bumpDataVersion: true })
+      } else if (imageDetail) {
+        await refreshProjectFileTree(pp, { bumpDataVersion: true })
+      }
       activity.updateItem(activityId, {
         status: "done",
-        detail: `Skipped (unchanged) — ${cachedFiles.length} files from previous ingest`,
-        filesWritten: cachedFiles,
+        detail: [knowledgePaths.length ? `逐节知识已核验 — ${completePaths.length} files` : `复用已有入库结果 — ${cachedFiles.length} files`, imageDetail].filter(Boolean).join("；"),
+        filesWritten: completePaths,
       })
-      return cachedFiles
+      return completePaths
     })
   }
 
@@ -987,6 +1093,7 @@ async function autoIngestImpl(
   const mmCfg = useWikiStore.getState().multimodalConfig
   const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
   if (!mmCfg.enabled && savedImages.length > 0) {
+    imageDetail = `图片描述未启用；已提取 ${savedImages.length} 张图片`
     // Strip recognized `![alt](url)` references with the shared parser. Preserve a single space
     // where the ref used to sit so adjacent words don't fuse.
     enrichedSourceContent = stripMarkdownImageReferences(sourceContent)
@@ -1020,6 +1127,7 @@ async function autoIngestImpl(
         }),
       )
       enrichedSourceContent = stripWikiMediaAbsPaths(pp, result.enrichedMarkdown)
+      imageDetail = formatImageCaptionResult(result)
       console.log(
         `[ingest:caption] images=${savedImages.length} fresh=${result.freshCaptions} cached=${result.cachedCaptions} failed=${result.failed}`,
       )
@@ -1028,18 +1136,28 @@ async function autoIngestImpl(
         `[ingest:caption] pipeline failed for "${fileName}":`,
         err instanceof Error ? err.message : err,
       )
+      imageDetail = "图片描述未完成，可查看活动记录后重试"
       // Fall through with original (empty-alt) source content —
       // captioning failure must NEVER break ingest.
     }
   }
 
+  throwIfIngestAborted(signal, activityId)
   const stableContextLength = schema.length + purpose.length + index.length + overview.length
   const sourceBudget = computeIngestSourceBudget(llmConfig.maxContextSize, stableContextLength)
+  const preparedParts = sp.endsWith(".wiki-source/source.md") && enrichedSourceContent.length > LONG_SOURCE_CHUNK_MIN
+    ? planPreparedBook(
+        enrichedSourceContent,
+        clampNumber(Math.floor(sourceBudget * 0.55), LONG_SOURCE_CHUNK_MIN, LONG_SOURCE_CHUNK_MAX),
+        3_000,
+        sourceBudget,
+      )
+    : null
   let sourceContext = enrichedSourceContent
   let precomputedAnalysis = ""
   let longSourceCheckpointPath: string | undefined
 
-  if (enrichedSourceContent.length > sourceBudget) {
+  if (preparedParts || enrichedSourceContent.length > sourceBudget) {
     const longSourcePlan = await analyzeLongSourceInChunks(
       pp,
       llmConfig,
@@ -1053,6 +1171,7 @@ async function autoIngestImpl(
       sourceBudget,
       activityId,
       signal,
+      preparedParts ?? undefined,
     )
     if (longSourcePlan.chunked) {
       sourceContext = longSourcePlan.sourceContext
@@ -1125,11 +1244,12 @@ async function autoIngestImpl(
     pp,
   )
   const previouslyCompletedPaths = generationCheckpoint?.completedPaths ?? []
-  let generation = ""
+  let generation = generationCheckpoint?.generationComplete === true ? "---RESUME COMPLETE---" : ""
   let generationError: string | null = null
   let generationTruncated = false
 
   try {
+    if (generationCheckpoint?.generationComplete !== true) {
     await streamChat(
       llmConfig,
       [
@@ -1181,6 +1301,7 @@ async function autoIngestImpl(
         max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
       },
     )
+    }
   } catch (err) {
     throwIfIngestAborted(signal, activityId)
     generationError = err instanceof Error ? err.message : String(err)
@@ -1283,9 +1404,12 @@ async function autoIngestImpl(
     ),
   )
 
-  if (unrecoveredTruncatedPaths.length > 0 && !signal?.aborted) {
+  // log.md has an existing deterministic fallback below; only content pages
+  // need a model repair. Keep log unresolved until the fallback really writes.
+  const pathsForModelRepair = unrecoveredTruncatedPaths.filter((path) => normalizePath(path).toLowerCase() !== "wiki/log.md")
+  if (pathsForModelRepair.length > 0 && !signal?.aborted) {
     activity.updateItem(activityId, {
-      detail: `Retrying truncated wiki files: ${unrecoveredTruncatedPaths.join(", ")}`,
+      detail: `Retrying truncated wiki files: ${pathsForModelRepair.join(", ")}`,
     })
     let repairOutput = ""
     let repairFailed = false
@@ -1296,7 +1420,7 @@ async function autoIngestImpl(
           {
             role: "system",
             content: buildTruncatedFileRepairPrompt(
-              unrecoveredTruncatedPaths,
+              pathsForModelRepair,
               sourceIdentity,
               {
                 schema,
@@ -1335,7 +1459,7 @@ async function autoIngestImpl(
       if (!repairFailed && repairOutput.trim()) {
         const filteredRepair = filterTruncatedFileRepairOutput(
           repairOutput,
-          unrecoveredTruncatedPaths,
+          pathsForModelRepair,
         )
         writeWarnings.push(...filteredRepair.warnings)
         const repairResult = await writeFileBlocks(
@@ -1364,7 +1488,7 @@ async function autoIngestImpl(
           }
         }
         for (const path of recoveredPaths) {
-          const warningPrefix = `FILE block "${path}" was not closed before end of stream`
+          const warningPrefix = `FILE block "${path}" was not closed before `
           for (let i = writeWarnings.length - 1; i >= 0; i--) {
             if (writeWarnings[i].startsWith(warningPrefix)) writeWarnings.splice(i, 1)
           }
@@ -1416,6 +1540,11 @@ async function autoIngestImpl(
       )
     }
   }
+  // A deterministic aggregate write also resolves its earlier truncated block.
+  // Failed writes remain unresolved and still fail the ingest below.
+  unrecoveredTruncatedPaths = unrecoveredTruncatedPaths.filter((path) =>
+    !writtenPaths.some((writtenPath) => normalizePath(writtenPath) === normalizePath(path))
+  )
 
   // Surface parser / writer warnings to the activity panel so users
   // don't have to open devtools to find out a block was dropped.
@@ -1538,6 +1667,27 @@ async function autoIngestImpl(
   }
 
   // ── Step 5: Save to cache ───────────────────────────────────
+  if (sourceIdentity.endsWith(".wiki-source/source.md")) {
+    // Coverage can fail independently of generation. Resume its verified
+    // records without repeating a successful full-book generation.
+    await saveGenerationCheckpoint(generationProgressPath, {
+      version: 1, sourceIdentity, sourceFingerprint: generationFingerprint,
+      completedPaths: writtenPaths.filter(path => !isAppManagedAggregatePath(path)),
+      generationComplete: true, updatedAt: Date.now(),
+    })
+  }
+  // A complete summary is not proof of book coverage. Preserve the original
+  // generation, then supplement only missing, source-grounded section records.
+  const knowledgePaths = await ensureSectionKnowledge({
+    projectPath: pp, sourceIdentity: knowledgeSourceIdentity, sourceContent, schema, config: llmConfig, signal,
+    onProgress: detail => activity.updateItem(activityId, { detail }),
+  })
+  for (const path of knowledgePaths) if (!writtenPaths.includes(path)) writtenPaths.push(path)
+  if (knowledgePaths.length) {
+    await updateWikiIndexDeterministically(pp, knowledgePaths)
+    await updateWikiOverviewDeterministically(pp, knowledgePaths)
+    await refreshProjectFileTree(pp, { bumpDataVersion: true })
+  }
   // Skip cache when a write fails or a truncated path remains unrecovered;
   // otherwise the partial result would be replayed without another LLM turn.
   if (
@@ -1588,7 +1738,7 @@ async function autoIngestImpl(
 
   activity.updateItem(activityId, {
     status: writtenPaths.length > 0 ? "done" : "error",
-    detail,
+    detail: [detail, imageDetail].filter(Boolean).join("；"),
     filesWritten: writtenPaths,
   })
 
@@ -1860,6 +2010,29 @@ export function canonicalizeSourcesField(content: string, sourceIdentity: string
   })
 
   return writeSources(content, deduped)
+}
+
+/** Validate newly generated package references before merging. Existing page
+ * provenance is preserved by the merger, including historical source versions.
+ * Never guess which source a model's mistyped hash was meant to reference. */
+export async function canonicalizeGeneratedSourcesField(
+  projectPath: string,
+  content: string,
+  sourceIdentity: string,
+): Promise<{ content: string; warnings: string[] }> {
+  const canonical = canonicalizeSourcesField(content, sourceIdentity)
+  const sources: string[] = []
+  const warnings: string[] = []
+  for (const source of parseSources(canonical)) {
+    if (
+      /\.wiki-source\/source\.md$/i.test(source)
+      && source.toLowerCase() !== normalizePath(sourceIdentity).toLowerCase()
+      && !(await fileExists(`${normalizePath(projectPath)}/raw/sources/${source}`))
+    ) {
+      warnings.push(`Discarded nonexistent prepared source reference "${source}"; no replacement identity was inferred.`)
+    } else sources.push(source)
+  }
+  return { content: warnings.length ? writeSources(canonical, sources) : canonical, warnings }
 }
 
 async function migrateLegacySourceSummaryIfSafe(
@@ -2161,7 +2334,9 @@ async function writeFileBlocks(
       content = stampGeneratedFrontmatterDates(content, today)
     }
     if (!isLogPath(relativePath) && !isListingPath(relativePath)) {
-      content = canonicalizeSourcesField(content, sourceFileName)
+      const checked = await canonicalizeGeneratedSourcesField(projectPath, content, sourceFileName)
+      content = checked.content
+      warnings.push(...checked.warnings)
     }
     if (sourceSummaryPath && relativePath === sourceSummaryPath) {
       content = sourceSummaryMediaRefsForExternalMarkdown(content)
@@ -2594,6 +2769,7 @@ export function buildGenerationPrompt(
     "- Derive filenames from the page title in the mandatory output language, but short proper nouns and technical identifiers take precedence: preserve names such as OpenAI, GPT-5, Transformer, CLIP, ImageNet, PyTorch, CUDA, GitHub, arXiv, React, LanceDB, AnyTXT, MinerU, model names, dataset names, tool names, and code identifiers in their standard original form. Do not put raw URLs, citation strings, or full paper titles directly into file paths; convert surrounding descriptive prose to a safe readable title. For Chinese/Japanese/Korean prose titles, keep readable CJK characters in the filename instead of translating the slug to English.",
     "- Preserve structured source data verbatim: copy SQL DDL / CREATE TABLE statements, schema definitions, API signatures, configuration, and tabular data into fenced code blocks (or Markdown tables) in the source summary page instead of paraphrasing them. Exact column names, types, constraints, primary/foreign keys, and indexes must survive ingest — a prose-only summary that drops them loses the structure the user imported the source to keep.",
     "- Follow the analysis recommendations on what to emphasize",
+    "- When a prepared-book context provides a chapter coverage list, include a separately titled note for every listed chapter in the source summary, followed by a whole-book overview. Keep chapter evidence attached to that chapter; chapter parts are not separate books. Retain the original source identity and valid location markers.",
     "- If the analysis found connections to existing pages, add cross-references",
     "",
     "## Review block types",
@@ -3084,7 +3260,8 @@ async function loadGenerationCheckpoint(
         completedPaths.push(path)
       }
     }
-    return { ...parsed, completedPaths }
+    return { ...parsed, completedPaths, generationComplete: parsed.generationComplete === true
+      && completedPaths.length > 0 && completedPaths.length === uniqueNormalizedPaths(parsed.completedPaths).length }
   } catch {
     return null
   }
@@ -3110,6 +3287,7 @@ async function clearGenerationCheckpoint(checkpointPath: string): Promise<void> 
 function isCompatibleLongSourceCheckpoint(
   checkpoint: LongSourceCheckpoint,
   params: {
+    analysisFormatVersion: 1
     sourceIdentity: string
     sourceHash: string
     sourceLength: number
@@ -3117,9 +3295,11 @@ function isCompatibleLongSourceCheckpoint(
     targetChars: number
     overlapChars: number
     chunkTotal: number
+    chunkPlanHash?: string
   },
 ): boolean {
   return checkpoint.version === 1
+    && checkpoint.analysisFormatVersion === params.analysisFormatVersion
     && checkpoint.sourceIdentity === params.sourceIdentity
     && checkpoint.sourceHash === params.sourceHash
     && checkpoint.sourceLength === params.sourceLength
@@ -3127,6 +3307,7 @@ function isCompatibleLongSourceCheckpoint(
     && checkpoint.targetChars === params.targetChars
     && checkpoint.overlapChars === params.overlapChars
     && checkpoint.chunkTotal === params.chunkTotal
+    && checkpoint.chunkPlanHash === params.chunkPlanHash
     && checkpoint.completedThrough >= 0
     && checkpoint.completedThrough <= params.chunkTotal
     && Array.isArray(checkpoint.analyses)
@@ -3167,10 +3348,32 @@ async function clearLongSourceCheckpoint(checkpointPath: string): Promise<void> 
   }
 }
 
-function extractMarkedSection(raw: string, heading: string): string {
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const re = new RegExp(`(?:^|\\n)##\\s+${escaped}\\s*\\n([\\s\\S]*?)(?=\\n##\\s|$)`, "i")
-  return re.exec(raw)?.[1]?.trim() ?? ""
+export function parseLongSourceAnalysis(raw: string): { analysis: string; digest: string } {
+  const sections = { analysis: [] as string[], digest: [] as string[] }
+  let active: keyof typeof sections | null = null
+  let fence = ""
+  let ended = false
+  for (const line of raw.replace(/\r\n/g, "\n").split("\n")) {
+    const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line)
+    if (fence) {
+      if (active) sections[active].push(line)
+      if (delimiter && delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length && !delimiter[2].trim()) fence = ""
+      continue
+    }
+    if (delimiter) { fence = delimiter[1]; if (active) sections[active].push(line); continue }
+    if (line.trim() === "---END LONG SOURCE ANALYSIS---") { ended = true; break }
+    const heading = /^##\s+(.+?)\s*#*\s*$/.exec(line)?.[1]?.toLowerCase()
+    const key = heading && ["chunk analysis", "分块分析", "分段分析"].includes(heading) ? "analysis"
+      : heading && ["updated global digest", "更新全局摘要", "更新后的全局摘要"].includes(heading) ? "digest" : null
+    if (key) {
+      if ((key === "analysis" && active !== null) || (key === "digest" && active !== "analysis")) throw new Error("Long-source analysis sections are duplicated or out of order")
+      active = key
+    } else if (active) sections[active].push(line)
+  }
+  const analysis = sections.analysis.join("\n").trim()
+  const digest = sections.digest.join("\n").trim()
+  if (!ended || !analysis || !digest) throw new Error("Long-source analysis is missing its complete analysis/digest sections or end marker; checkpoint was not advanced")
+  return { analysis, digest }
 }
 
 export function buildChunkAnalysisSystemPrompt(
@@ -3188,6 +3391,7 @@ export function buildChunkAnalysisSystemPrompt(
     languageRule(sourceContent),
     "",
     "Output exactly two markdown sections:",
+    "Keep the literal headings `## Chunk Analysis` and `## Updated Global Digest` in English even when the body uses another output language. After the digest, output the exact standalone line `---END LONG SOURCE ANALYSIS---`. Do not translate these protocol markers.",
     "HARD OUTPUT LIMITS: each section must stay within 60 lines; list at most 25 entities and 25 concepts; never use a table for entity enumeration.",
     "",
     "## Chunk Analysis",
@@ -3224,6 +3428,8 @@ function buildChunkAnalysisUserPrompt(
     folderContext ? `Folder context: ${folderContext}` : "",
     `Chunk: ${chunk.index}/${chunk.total}`,
     chunk.headingPath ? `Heading path: ${chunk.headingPath}` : "",
+    chunk.chapter ? `Prepared chapter: ${chunk.chapter.chapterTitle} (${chunk.chapter.chapterId}); part ${chunk.chapter.part}/${chunk.chapter.parts}. This part belongs only to this chapter. Keep its evidence and summary under this chapter in the updated digest.` : "",
+    chunk.chapter ? `Sections in this chapter part: ${chunk.chapter.sectionTitles.join("; ")}` : "",
     "",
     "## Current Global Digest",
     globalDigest || "(No prior digest yet.)",
@@ -3233,7 +3439,7 @@ function buildChunkAnalysisUserPrompt(
     "## MAIN CHUNK TO ANALYZE",
     chunk.main,
     "",
-    "Return only the two requested sections. Do not repeat overlap-only facts unless the main chunk supports them.",
+    "Return only the two requested sections followed by ---END LONG SOURCE ANALYSIS---. Do not repeat overlap-only facts unless the main chunk supports them.",
   ].filter(Boolean).join("\n")
 }
 
@@ -3250,10 +3456,16 @@ async function analyzeLongSourceInChunks(
   sourceBudget: number,
   activityId: string,
   signal?: AbortSignal,
+  preparedParts?: PreparedBookPart[],
 ): Promise<LongSourcePlan> {
   const targetChars = clampNumber(Math.floor(sourceBudget * 0.55), LONG_SOURCE_CHUNK_MIN, LONG_SOURCE_CHUNK_MAX)
   const overlapChars = clampNumber(Math.floor(targetChars * 0.08), 800, 3_000)
-  const chunks = splitSourceIntoSemanticChunks(sourceContent, targetChars, overlapChars)
+  const chunks: SourceChunk[] = preparedParts
+    ? preparedParts.map(({ main, overlapBefore, ...chapter }, index) => ({
+        id: `${chapter.chapterId}-part-${chapter.part}`, index: index + 1, total: preparedParts.length,
+        headingPath: chapter.chapterTitle, main, overlapBefore, chapter,
+      }))
+    : splitSourceIntoSemanticChunks(sourceContent, targetChars, overlapChars)
   if (chunks.length <= 1) {
     return { chunked: false, analysis: "", sourceContext: sourceContent }
   }
@@ -3263,6 +3475,7 @@ async function analyzeLongSourceInChunks(
   const sourceHash = hashTextHex(sourceContent)
   const checkpointPath = longSourceCheckpointPath(projectPath, sourceSummarySlug, sourceHash)
   const checkpointParams = {
+    analysisFormatVersion: 1 as const,
     sourceIdentity,
     sourceHash,
     sourceLength: sourceContent.length,
@@ -3270,6 +3483,7 @@ async function analyzeLongSourceInChunks(
     targetChars,
     overlapChars,
     chunkTotal: chunks.length,
+    ...(preparedParts ? { chunkPlanHash: hashTextHex(JSON.stringify(chunks)) } : {}),
   }
   const checkpoint = await loadLongSourceCheckpoint(checkpointPath, checkpointParams)
   let globalDigest = checkpoint?.globalDigest ?? ""
@@ -3287,7 +3501,9 @@ async function analyzeLongSourceInChunks(
     if (chunk.index <= completedThrough) continue
     throwIfIngestAborted(signal, activityId)
     activity.updateItem(activityId, {
-      detail: `Analyzing long source chunk ${chunk.index}/${chunk.total}...`,
+      detail: chunk.chapter
+        ? `Analyzing ${chunk.chapter.chapterTitle}, part ${chunk.chapter.part}/${chunk.chapter.parts} (${chunk.index}/${chunk.total})...`
+        : `Analyzing long source chunk ${chunk.index}/${chunk.total}...`,
     })
 
     let raw = ""
@@ -3329,15 +3545,14 @@ async function analyzeLongSourceInChunks(
       throw new Error(message)
     }
 
-    const chunkAnalysis = extractMarkedSection(raw, "Chunk Analysis") || raw.trim()
-    const nextDigest = extractMarkedSection(raw, "Updated Global Digest")
+    const { analysis: chunkAnalysis, digest: nextDigest } = parseLongSourceAnalysis(raw)
     analyses.push([
       `## Chunk ${chunk.index}/${chunk.total}${chunk.headingPath ? ` — ${chunk.headingPath}` : ""}`,
       trimLongText(chunkAnalysis, LONG_SOURCE_CHUNK_ANALYSIS_MAX),
     ].join("\n"))
 
     globalDigest = trimLongText(
-      nextDigest || [globalDigest, chunkAnalysis].filter(Boolean).join("\n\n"),
+      nextDigest,
       LONG_SOURCE_DIGEST_MAX,
     )
     completedThrough = chunk.index
@@ -3364,7 +3579,10 @@ async function analyzeLongSourceInChunks(
   const sourceContext = [
     `# Long Source Context: ${sourceIdentity}`,
     "",
-    `The original source was analyzed in ${chunks.length} semantic chunks with paragraph/section boundaries and overlap. Use this consolidated context instead of assuming the raw document ended early.`,
+    preparedParts
+      ? `The original prepared book was analyzed in ${chunks.length} parts inside explicit chapter boundaries. No part or overlap crosses a chapter. Use the chapter notes below to build the whole-book overview.`
+      : `The original source was analyzed in ${chunks.length} semantic chunks with paragraph/section boundaries and overlap. Use this consolidated context instead of assuming the raw document ended early.`,
+    ...(preparedParts ? ["", "## Chapter coverage", ...Array.from(new Map(preparedParts.map(part => [part.chapterId, part.chapterTitle])).values()).map(title => `- ${title}`)] : []),
     "",
     "## Final Global Digest",
     globalDigest || "(No digest produced.)",
@@ -3382,7 +3600,7 @@ async function analyzeLongSourceInChunks(
  * Page-merge.ts handles all the sanity-checking and fallback paths;
  * this is just the "stream the LLM" wrapper.
  */
-function buildPageMerger(llmConfig: LlmConfig): MergeFn {
+export function buildPageMerger(llmConfig: LlmConfig): MergeFn {
   return async (existingContent, incomingContent, sourceFileName, signal) => {
     const systemPrompt = buildPageMergeSystemPrompt()
     const sanitizeProvenance = (value: string) => value
@@ -3415,7 +3633,7 @@ function buildPageMerger(llmConfig: LlmConfig): MergeFn {
       "",
       "---",
       "",
-      "Now output the merged file. Start with `---` on the first line.",
+      "Now output the complete merged file inside exactly one `---FILE: wiki/merged-page.md---` / `---END FILE---` block. Put both markers on their own lines.",
     ].join("\n")
 
     let result = ""
@@ -3447,7 +3665,13 @@ function buildPageMerger(llmConfig: LlmConfig): MergeFn {
       })
     })
     if (streamError) throw streamError
-    return result
+    // CLI providers may append a separate status message after the document.
+    // Reuse the generation protocol so only a complete file enters the merger.
+    const parsed = parseFileBlocks(result)
+    if (parsed.blocks.length !== 1 || parsed.blocks[0].path !== "wiki/merged-page.md" || parsed.warnings.length > 0) {
+      throw new Error("Page merge did not return one complete merged file block")
+    }
+    return parsed.blocks[0].content
   }
 }
 
@@ -3472,8 +3696,8 @@ export function buildPageMergeSystemPrompt(): string {
     "- Never invent URLs, citations, source names, or placeholder references",
     "",
     "Output requirements:",
-    "- The FIRST character of your response MUST be `-` (the opening of `---`)",
-    "- Output the COMPLETE file: YAML frontmatter + body",
+    "- Output exactly one block beginning with `---FILE: wiki/merged-page.md---` and ending with `---END FILE---`, each on its own line",
+    "- Inside the block output the COMPLETE file: YAML frontmatter + body",
     "- No preamble (no \"Here is the merged version:\"), no analysis prose",
     "- The caller will overwrite `sources`/`tags`/`related`/`updated` with",
     "  deterministic values — your job is the body and any other fields",
@@ -3517,13 +3741,14 @@ async function injectImagesIntoSourceSummary(
   sourceSummarySlug: string,
   savedImages: { relPath: string; page: number | null; sha256?: string }[],
   outputLanguage?: string,
+  options?: { strict?: boolean; signal?: AbortSignal },
 ): Promise<void> {
   if (savedImages.length === 0) return
   const sourceSummaryPath = `wiki/sources/${sourceSummarySlug}.md`
   const sourceSummaryFullPath = `${pp}/${sourceSummaryPath}`
   console.log(`[ingest:diag] injectImagesIntoSourceSummary: target=${sourceSummaryFullPath}, images=${savedImages.length}`)
   try {
-    const existing = await tryReadFile(sourceSummaryFullPath)
+    const existing = options?.strict ? await readFile(sourceSummaryFullPath) : await tryReadFile(sourceSummaryFullPath)
     console.log(`[ingest:diag] injectImagesIntoSourceSummary: existing file ${existing ? `read OK (${existing.length} chars)` : "MISSING (will write stub)"}`)
     // Load captions from the on-disk cache so the safety-net
     // section embeds caption text as alt — the embedding pipeline
@@ -3531,12 +3756,27 @@ async function injectImagesIntoSourceSummary(
     // by image content (e.g. "find the chart with revenue data")
     // never matches because alt text was empty.
     const captionsBySha = await loadCaptionCache(pp, outputLanguage)
+    // Reuse the byte-verified source/image mapping used by search and chat.
+    // Only prepared Markdown packages carry the external page/block markers.
+    const sourceEvidence = new Map<string, ImageSourceEvidence>()
+    if (sourceIdentity.endsWith(".wiki-source/source.md")) {
+      const rawPath = `${pp}/raw/sources/${sourceIdentity}`
+      const markdown = await tryReadFile(rawPath)
+      if (markdown) for (const image of savedImages) {
+        const match = await resolveSourceMarkdownImage(pp, rawPath, markdown, image.relPath)
+        if (match) sourceEvidence.set(toSourceSummaryImageRef(image.relPath), {
+          sourcePath: `raw/sources/${sourceIdentity}`, line: match.line, sourceLocation: match.sourceLocation,
+          figureCaption: match.figureCaption,
+        })
+      }
+    }
     const newSection = buildImageMarkdownSection(
       savedImages.map((img) => ({
         ...img,
         relPath: toSourceSummaryImageRef(img.relPath),
       })) as never,
       captionsBySha,
+      sourceEvidence,
     )
     const marker = "<!-- llm-wiki:embedded-images -->"
     const wrapped = `\n\n${marker}\n${newSection.trim()}\n${marker}\n`
@@ -3547,8 +3787,20 @@ async function injectImagesIntoSourceSummary(
         new RegExp(`\\n*${marker}[\\s\\S]*?${marker}\\n*`, "g"),
         "",
       )
-      await writeFile(sourceSummaryFullPath, stripped.trimEnd() + wrapped)
+      throwIfIngestAborted(options?.signal)
+      if (options?.strict) {
+        // Preserve every byte outside the explicitly managed image markers.
+        // An unmatched marker is ambiguous and must not consume user text.
+        if ((existing.split(marker).length - 1) % 2 !== 0) throw new Error("受管图片区标记不完整，停止补图以保护正文")
+        const next = existing.includes(marker)
+          ? existing.replace(new RegExp(`${marker}[\\s\\S]*?${marker}`, "g"), `${marker}\n${newSection.trim()}\n${marker}`)
+          : existing + wrapped
+        await writeSourceImagesIfUnchanged(pp, sourceSummaryPath, existing, next)
+      } else {
+        await writeFile(sourceSummaryFullPath, stripped.trimEnd() + wrapped)
+      }
     } else {
+      if (options?.strict) throw new Error("来源摘要页缺失或为空，停止补图以保护正文")
       // Page is missing — write a minimal stub so the user actually
       // sees the images in the file tree. Without this fallback, the
       // images sit in wiki/media/<slug>/ with no .md page referencing
@@ -3580,6 +3832,7 @@ async function injectImagesIntoSourceSummary(
       `[ingest:images] failed to append images to ${sourceSummaryPath}:`,
       err instanceof Error ? err.message : err,
     )
+    if (options?.strict) throw err
   }
 }
 
@@ -3858,7 +4111,9 @@ async function executeIngestWritesImpl(
       !isLogPath(relativePath) &&
       !isListingPath(relativePath)
     ) {
-      content = canonicalizeSourcesField(content, activeSourceIdentity)
+      const checked = await canonicalizeGeneratedSourcesField(pp, content, activeSourceIdentity)
+      content = checked.content
+      summaryWarnings.push(...checked.warnings)
     }
 
     const fullPath = `${pp}/${relativePath}`
@@ -3871,6 +4126,17 @@ async function executeIngestWritesImpl(
           : content.trim()
         await writeFile(fullPath, appended)
       } else {
+        if (activeSourceIdentity) {
+          const existing = await tryReadFile(fullPath)
+          if (existing) {
+            // Validate only the model's incoming references. An archived
+            // source must not disappear from an existing page's provenance.
+            content = canonicalizeSourcesField(
+              writeSources(content, [...parseSources(existing), ...parseSources(content)]),
+              activeSourceIdentity,
+            )
+          }
+        }
         await writeFile(fullPath, content)
       }
       writtenPaths.push(fullPath)

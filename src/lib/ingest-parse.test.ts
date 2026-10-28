@@ -37,6 +37,13 @@ import {
 // ── Happy paths ─────────────────────────────────────────────────────
 
 describe("parseFileBlocks — canonical shapes", () => {
+  it("drops an unclosed draft before another FILE opener without swallowing the next file", () => {
+    const result = parseFileBlocks("---FILE: wiki/draft.md---\nDraft\n---FILE: wiki/complete.md---\nComplete\n---END FILE---")
+    expect(result.blocks).toEqual([{ path: "wiki/complete.md", content: "Complete" }])
+    expect(result.truncatedPaths).toEqual(["wiki/draft.md"])
+    expect(result.warnings).toHaveLength(1)
+  })
+
   it("extracts a single well-formed block", () => {
     const text = [
       "---FILE: wiki/concepts/rope.md---",

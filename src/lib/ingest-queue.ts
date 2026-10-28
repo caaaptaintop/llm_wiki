@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "@/commands/fs"
-import { autoIngest } from "./ingest"
+import { autoIngest, type IngestMode } from "./ingest"
 import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
 import { getProjectPathById } from "@/lib/project-identity"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
@@ -16,6 +16,8 @@ export interface IngestTask {
    *  look up the current path via the registry at run time. */
   projectId: string
   sourcePath: string  // relative to project: "raw/sources/folder/file.pdf"
+  /** Absent on legacy tasks means full ingestion. */
+  mode?: IngestMode
   folderContext: string  // e.g. "AI-Research > papers" or ""
   status: "pending" | "processing" | "done" | "failed" | "cancelled"
   addedAt: number
@@ -207,6 +209,7 @@ function upsertQueuedIngestTask(
   projectId: string,
   sourcePath: string,
   folderContext: string,
+  mode: IngestMode = "full",
 ): string {
   if (queue.length === 0 && activeRuns.size === 0) {
     resetQueueAccounting()
@@ -214,6 +217,7 @@ function upsertQueuedIngestTask(
   const normalizedSourcePath = normalizeSourcePathForQueue(sourcePath)
   const pendingOrStopped = queue.find((t) =>
     t.projectId === projectId &&
+    (t.mode ?? "full") === mode &&
     (t.status === "pending" || t.status === "failed" || t.status === "cancelled") &&
     sameQueuedSourcePath(t.sourcePath, normalizedSourcePath)
   )
@@ -229,12 +233,14 @@ function upsertQueuedIngestTask(
 
   const processingTask = queue.find((t) =>
     t.projectId === projectId &&
+    (t.mode ?? "full") === mode &&
     t.status === "processing" &&
     sameQueuedSourcePath(t.sourcePath, normalizedSourcePath)
   )
   const pendingRerun = processingTask
     ? queue.find((t) =>
         t.projectId === projectId &&
+        (t.mode ?? "full") === mode &&
         t.status === "pending" &&
         sameQueuedSourcePath(t.sourcePath, normalizedSourcePath)
       )
@@ -248,6 +254,7 @@ function upsertQueuedIngestTask(
     id: generateId(),
     projectId,
     sourcePath: normalizedSourcePath,
+    mode,
     folderContext,
     status: "pending",
     addedAt: Date.now(),
@@ -297,6 +304,7 @@ export async function enqueueIngest(
   projectId: string,
   sourcePath: string,
   folderContext: string = "",
+  mode: IngestMode = "full",
 ): Promise<string> {
   if (!currentProjectId || currentProjectId !== projectId) {
     throw new Error(
@@ -304,7 +312,7 @@ export async function enqueueIngest(
     )
   }
 
-  const id = upsertQueuedIngestTask(projectId, sourcePath, folderContext)
+  const id = upsertQueuedIngestTask(projectId, sourcePath, folderContext, mode)
   await saveQueue(currentProjectPath)
 
   processNext(currentProjectId)
@@ -318,7 +326,7 @@ export async function enqueueIngest(
  */
 export async function enqueueBatch(
   projectId: string,
-  files: Array<{ sourcePath: string; folderContext: string }>,
+  files: Array<{ sourcePath: string; folderContext: string; mode?: IngestMode }>,
 ): Promise<string[]> {
   if (!currentProjectId || currentProjectId !== projectId) {
     throw new Error(
@@ -328,7 +336,7 @@ export async function enqueueBatch(
 
   const ids: string[] = []
   for (const file of files) {
-    ids.push(upsertQueuedIngestTask(projectId, file.sourcePath, file.folderContext))
+    ids.push(upsertQueuedIngestTask(projectId, file.sourcePath, file.folderContext, file.mode))
   }
 
   await saveQueue(currentProjectPath)
@@ -346,7 +354,7 @@ export async function enqueueBatch(
 export async function enqueueInactiveProjectBatch(
   projectId: string,
   projectPath: string,
-  files: Array<{ sourcePath: string; folderContext: string }>,
+  files: Array<{ sourcePath: string; folderContext: string; mode?: IngestMode }>,
 ): Promise<string[]> {
   if (currentProjectId === projectId) {
     return enqueueBatch(projectId, files)
@@ -369,6 +377,7 @@ export async function enqueueInactiveProjectBatch(
         : normalizedSourcePath
       const existing = persisted.find((task) =>
         task.projectId === projectId &&
+        (task.mode ?? "full") === (file.mode ?? "full") &&
         task.status !== "done" &&
         normalizePath(task.sourcePath) === sourcePath
       )
@@ -385,6 +394,7 @@ export async function enqueueInactiveProjectBatch(
         projectId,
         sourcePath,
         folderContext: file.folderContext,
+        mode: file.mode ?? "full",
         status: "pending",
         addedAt: Date.now(),
         error: null,
@@ -1098,7 +1108,7 @@ async function runTask(
       run.controller.signal,
       task.folderContext,
       trackWrittenFile,
-      { runCommit },
+      { runCommit, mode: task.mode },
     )
     if (currentProjectId !== projectId || run.epoch !== queueEpoch) return
     run.writtenFiles = writtenFiles
@@ -1116,7 +1126,7 @@ async function runTask(
     cancelledInFlightTaskIds.delete(task.id)
     queue = queue.filter((candidate) => candidate.id !== task.id)
     completedSinceIdle++
-    processedSinceDrain = true
+    if (task.mode !== "images-only") processedSinceDrain = true
     await saveQueue(projectPath)
     console.log(`[Ingest Queue] Done: ${task.sourcePath}`)
   } catch (err) {

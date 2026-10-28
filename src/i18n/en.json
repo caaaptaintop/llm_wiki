@@ -1,4 +1,13 @@
 {
+  "reader": {
+    "evidenceDetails": "Evidence & source details",
+    "maintenance": "Page metadata",
+    "sources": "Sources",
+    "related": "Related",
+    "locator": "Source location",
+    "epubLocator": "EPUB spine item {{item}} · block {{block}} (not a page number)",
+    "pdfLocator": "PDF page {{item}} · block {{block}}"
+  },
   "app": {
     "title": "LLM Wiki",
     "subtitle": "Build and maintain your personal knowledge base with LLMs"
@@ -17,6 +26,7 @@
     "diagram": "Diagram"
   },
   "nav": {
+    "books": "Evidence review",
     "chat": "Chat",
     "wiki": "Wiki",
     "sources": "Sources",
@@ -169,7 +179,7 @@
     "import": "Import",
     "importing": "Importing...",
     "noSources": "No sources yet",
-    "importHint": "Import documents to start building your wiki",
+    "importHint": "Imported sources use the automatic processing queue to extract concepts, connect knowledge, and merge Wiki pages. For a preprocessed book, select source.md inside its source package or select the package folder. Books and short materials share this queue; no separate topic search is needed. Short materials can use Markdown / TXT directly without MinerU.",
     "importFiles": "Import Files",
     "importFolder": "Folder",
     "importUrls": "URLs",
@@ -300,7 +310,8 @@
     },
     "agentMode": "Agent mode",
     "retrievalMode": "Retrieval mode",
-    "retrievalModeHint": "Standard keeps the existing behavior. Smart iteratively closes evidence gaps. Raw sources only answers exclusively from original source excerpts.",
+    "retrievalModeHint": "Standard keeps existing behavior. Smart adds source evidence (one bounded pass for CLI; iterative retrieval for HTTP models). Raw sources only uses this turn's source excerpts, not prior answers.",
+    "faithfulNoEvidence": "No matching raw-source excerpts were found. The provided sources are insufficient to answer this question.",
     "retrievalModes": {
       "standard": "Standard retrieval",
       "smart": "Smart retrieval",
@@ -1175,5 +1186,70 @@
     "minutesAgo": "{{count}} min ago",
     "hoursAgo": "{{count}} h ago",
     "daysAgo": "{{count}} d ago"
+  },
+  "books": {
+    "title": "Evidence review",
+    "description": "Use Sources as the default import workflow for books and short materials. Its automatic queue extracts concepts, links knowledge, and merges Wiki pages. This optional workspace is for checking individual citations and focused comparisons.",
+    "noProject": "Open a project to review evidence when needed.",
+    "refresh": "Refresh",
+    "import": "Import for review",
+    "fileFilter": "Material source files (Markdown / TXT)",
+    "evidenceHelp": "Evidence counts show recorded quotations. Check the original text at the marked locations; completed processing does not mean human review.",
+    "configureLlm": "Configure a document-processing model in Settings before processing materials, discovering topics, or creating a Wiki.",
+    "settings": "Open Settings",
+    "failed": "Could not finish: {{message}}",
+    "completed": "All chapters/sections and the material overview are complete.",
+    "incomplete": "This material is not complete. Check chapter/section errors and continue.",
+    "cancelled": "Cancelled. Review progress before continuing.",
+    "cancelling": "Cancelling…",
+    "empty": "For everyday knowledge building, import books and short materials in Sources to generate and connect Wiki pages automatically. Import here only when you want to check individual citations or keep focused comparison records.",
+    "version": "Version {{revision}}",
+    "progress": "{{done}} / {{total}} chapters/sections complete",
+    "selectForSynthesis": "Include in optional comparison",
+    "original": "Source file",
+    "originalMaterial": "Original material filename",
+    "fullText": "Material text",
+    "overview": "Material overview",
+    "process": "Process material",
+    "resume": "Continue / retry",
+    "warnings": "Reading notes",
+    "chapters": "Chapters / sections",
+    "chapterStatus": "Status",
+    "evidence": "Evidence",
+    "location": "Source location",
+    "files": "Read",
+    "pdfPages": "PDF pages {{start}}–{{end}}",
+    "epubSection": "EPUB section: {{section}}",
+    "lines": "Text lines {{start}}–{{end}}",
+    "chapterText": "Text",
+    "notes": "Notes",
+    "openChapter": "Open text: {{title}}",
+    "openNotes": "Open notes: {{title}}",
+    "synthesis": "Compare materials when needed",
+    "synthesisHelp": "Select at least two completed review materials, then click Find comparison topics or enter a topic. Model calls here require a click; the automatic Sources workflow does not need this step.",
+    "topic": "Your comparison topic",
+    "topicPlaceholder": "For example: how habits influence decisions",
+    "synthesize": "Create comparison Wiki ({{total}} materials)",
+    "noOutput": "No Wiki file was returned.",
+    "running": {
+      "import": "Reading material and preparing chapters/sections…",
+      "process": "Processing material…",
+      "synthesize": "Creating comparison Wiki…",
+      "discover": "Finding comparison topics…"
+    },
+    "status": {
+      "prepared": "Ready to process",
+      "pending": "Pending",
+      "processing": "In progress",
+      "partial": "Partially complete",
+      "complete": "Complete",
+      "error": "Needs retry"
+    },
+    "discoverTopics": "Find comparison topics",
+    "topicSuggestions": "Comparison topic suggestions",
+    "relatedMaterials": "Related materials ({{total}})",
+    "generateTopic": "Create comparison Wiki",
+    "noTopics": "No comparison topics covering at least two review materials were found. Adjust the selection or enter a topic.",
+    "goToSources": "Go to Sources"
   }
 }

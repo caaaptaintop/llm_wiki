@@ -441,18 +441,6 @@ export async function captionMarkdownImages(
     }
   }
 
-  if (llmConfig.provider === "codex-cli") {
-    console.warn(
-      "[caption-pipeline] skipped image captioning: Codex CLI transport does not support image input yet.",
-    )
-    return {
-      enrichedMarkdown: markdown,
-      freshCaptions: 0,
-      cachedCaptions: 0,
-      failed: targetRefs.length,
-    }
-  }
-
   const cache = await readCache(projectPath)
   let freshCaptions = 0
   let cachedCaptions = 0
@@ -542,6 +530,8 @@ export async function captionMarkdownImages(
           outputLanguage: options?.outputLanguage,
         },
       )
+      options?.signal?.throwIfAborted()
+      if (!caption.trim()) throw new Error("图片描述为空，未保存结果")
       cache[cacheKey] = {
         caption,
         mimeType: bytes.mimeType,
@@ -595,6 +585,9 @@ export async function captionMarkdownImages(
       )
     }
   }
+  // Keep successful cache entries, but never report an interrupted batch as
+  // finished or publish its partial result into a source summary.
+  options?.signal?.throwIfAborted()
 
   // Rewrite all refs in one pass so large image-heavy documents do not copy
   // the full Markdown string once per image.

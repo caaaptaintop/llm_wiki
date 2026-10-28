@@ -67,8 +67,10 @@ import { resolveIngestReasoning } from "@/lib/reasoning-capabilities"
  *     when we splice it as alt text (`![CAPTION](path)` — newlines
  *     or markdown inside CAPTION corrupt the surrounding doc).
  */
+const CAPTION_RELATIONSHIPS = "Preserve explicit relationships: pair each time period, category or stage with its aligned labels and values, and describe what arrows connect. If an association is visually unclear, say so instead of guessing."
+
 export const CAPTION_PROMPT =
-  "Describe this image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. Do NOT speculate or editorialize. 2 to 4 sentences. Output plain text only — no markdown, no preamble."
+  `Describe this image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. ${CAPTION_RELATIONSHIPS} Do NOT speculate or editorialize. 2 to 4 sentences. Output plain text only — no markdown, no preamble.`
 
 function captionLanguageInstruction(outputLanguage?: string): string {
   const language = outputLanguage?.trim()
@@ -108,6 +110,7 @@ export function buildCaptionPromptWithContext(
     "This surrounding text MAY help describe the image — for example, a sentence like \"Figure 3: Q2 revenue chart\" tells you what the chart actually plots. It MAY ALSO be unrelated body text that just happens to flank the image. Use your judgment: if a passage clearly identifies, references, or labels the image, anchor your caption to it; if not, ignore the surrounding text and describe what you see.",
     "",
     "Now describe the image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. If the surrounding text contains a relevant figure number / caption / referent, incorporate that specifically. Do NOT invent details that aren't visible in the image or directly stated in the surrounding text. 2 to 4 sentences. Output plain text only — no markdown, no preamble.",
+    CAPTION_RELATIONSHIPS,
     captionLanguageInstruction(outputLanguage),
   ].filter(Boolean).join("\n")
 }
@@ -170,10 +173,6 @@ export async function captionImage(
   signal?: AbortSignal,
   options?: CaptionOptions,
 ): Promise<string> {
-  if (llmConfig.provider === "codex-cli") {
-    throw new Error("Codex CLI transport does not support image input for captioning yet.")
-  }
-
   // Pick the context-aware prompt iff EITHER side has non-trivial
   // content. Whitespace-only context is treated as "no context" so a
   // caller passing untrimmed slices doesn't accidentally upgrade to

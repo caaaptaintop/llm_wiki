@@ -1,3 +1,4 @@
+import type { IngestMode } from "./ingest"
 import {
   copyFile,
   createDirectory,
@@ -41,6 +42,7 @@ import type { SourceWatchConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { preprocessSourceFiles } from "@/lib/source-preprocess"
 import { moveParsedMarkdown, removeParsedMarkdown } from "@/lib/parsed-source-output"
+import { importPreparedSource, isPreparedSourceArtifact, isPreparedSourceFile } from "@/lib/prepared-source"
 
 export const INGESTABLE_SOURCE_EXTENSIONS = new Set([
   "md",
@@ -234,6 +236,7 @@ export async function migrateSourcePath(
 
 export function isIngestableSourcePath(path: string): boolean {
   const normalized = normalizePath(path)
+  if (isPreparedSourceArtifact(normalized)) return false
   if (normalized.split("/").includes(".cache")) return false
   const fileName = normalized.split("/").pop() ?? ""
   if (!fileName || fileName.startsWith(".")) return false
@@ -259,7 +262,7 @@ export async function enqueueSourceIngest(
   project: WikiProject,
   sourcePaths: string[],
   llmConfig: LlmConfig,
-  options: { sourceRoot?: string; rootContext?: string; parsingConcurrency?: number } = {},
+  options: { sourceRoot?: string; rootContext?: string; parsingConcurrency?: number; mode?: IngestMode } = {},
 ): Promise<string[]> {
   // Extraction can be expensive (OCR and Office parsers in particular).
   // Do not parse a batch that cannot proceed to ingest because no usable
@@ -273,6 +276,7 @@ export async function enqueueSourceIngest(
     )
     .map((sourcePath) => ({
       sourcePath,
+      ...(options.mode ? { mode: options.mode } : {}),
       folderContext: withRootContext(
         folderContextForSourcePath(sourcePath, options.sourceRoot),
         options.rootContext,
@@ -281,7 +285,9 @@ export async function enqueueSourceIngest(
   if (files.length === 0) return []
   const parsingConcurrency = options.parsingConcurrency
     ?? normalizeSourceWatchConfig(useWikiStore.getState().sourceWatchConfig).parsingConcurrency
-  await preprocessSourceFiles(files.map((file) => file.sourcePath), parsingConcurrency)
+  if (options.mode !== "images-only") {
+    await preprocessSourceFiles(files.map((file) => file.sourcePath), parsingConcurrency)
+  }
   return enqueueBatch(project.id, files)
 }
 
@@ -356,8 +362,14 @@ export async function importSourceFiles(
       continue
     }
 
-    const destPath = await getUniqueDestPath(`${pp}/raw/sources`, originalName)
     try {
+      const prepared = await importPreparedSource(pp, sourcePath, maxBytes,
+        (path) => isPathAllowedBySourceWatch(path, explicitImportConfig))
+      if (prepared) {
+        importedPaths.push(prepared)
+        continue
+      }
+      const destPath = await getUniqueDestPath(`${pp}/raw/sources`, originalName)
       await copyFile(sourcePath, destPath)
       importedPaths.push(destPath)
     } catch (err) {
@@ -388,6 +400,14 @@ export async function importSourceFolder(
   const destDir = `${pp}/raw/sources/${folderName}`
   const cfg = normalizeSourceWatchConfig(sourceWatchConfig)
   const maxBytes = cfg.maxFileSizeMb * 1024 * 1024
+  // Selecting a complete prepared bundle is the same import as selecting its
+  // source.md. Preserve sibling assets and keep a single queue identity.
+  if (sourceRoot.endsWith(".wiki-source") || (await fileExists(`${sourceRoot}/source.md`) && await isPreparedSourceFile(`${sourceRoot}/source.md`))) {
+    if (!isPathAllowedBySourceWatch(`${sourceRoot}/source.md`, cfg)) {
+      return { imported: [], skipped: [{ name: "source.md", reason: "excluded" }] }
+    }
+    return importSourceFiles(project, [`${sourceRoot}/source.md`], llmConfig, cfg)
+  }
   const allowedFiles: string[] = []
   const skipped: SkippedSourceImport[] = []
   // include hidden: a user importing a folder into raw/sources may
@@ -395,8 +415,26 @@ export async function importSourceFolder(
   // agent/tool config folders are still filtered before copy so API
   // keys / tool config do not enter ingest.
   const sourceFiles = flattenFiles(await listDirectory(selectedFolder, true))
+  const filePaths = new Set(sourceFiles.map((file) => normalizePath(file.path)))
+  const packageRoots: string[] = []
+  for (const file of sourceFiles) {
+    const explicitRoot = normalizePath(file.path).match(/^(.*?\.wiki-source)\//)?.[1]
+    if (explicitRoot) {
+      if (!packageRoots.includes(explicitRoot)) packageRoots.push(explicitRoot)
+    } else if (file.name === "source.md" && await isPreparedSourceFile(file.path)) {
+      packageRoots.push(parentPath(file.path))
+    }
+  }
+  packageRoots.sort((a, b) => a.length - b.length)
+  for (const root of packageRoots) {
+    if (!filePaths.has(`${root}/source.md`)) {
+      skipped.push({ name: getRelativePath(root, sourceRoot), reason: "unreadable", detail: "源包缺少 source.md，请重新导出完整源包" })
+    }
+  }
 
   for (const file of sourceFiles) {
+    const packageRoot = packageRoots.find((root) => normalizePath(file.path).startsWith(`${root}/`))
+    if (packageRoot && normalizePath(file.path) !== `${packageRoot}/source.md`) continue
     const relativeSourcePath = getRelativePath(file.path, sourceRoot)
     const displayName = relativeSourcePath || file.name
     const destPath = `${destDir}/${relativeSourcePath}`
@@ -420,6 +458,13 @@ export async function importSourceFolder(
       continue
     }
     try {
+      if (packageRoot) {
+        const prepared = await importPreparedSource(pp, file.path, maxBytes,
+          (path) => isPathAllowedBySourceWatch(`raw/sources/${folderName}/${getRelativePath(path, sourceRoot)}`, { ...cfg, includeExtensions: [] }))
+        if (!prepared) throw new Error("源包清单已变化，请重新导入")
+        allowedFiles.push(prepared)
+        continue
+      }
       const parent = parentPath(destPath)
       if (parent) await createDirectory(parent)
       await copyFile(file.path, destPath)

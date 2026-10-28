@@ -383,6 +383,9 @@ pub async fn restore_file_history(
     entry_id: String,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Match CAS/editor saves: file write lock before HISTORY_LOCK, held
+        // until both the pre-restore history and restored body are written.
+        let _write_guard = super::fs::lock_file_writes();
         let (root, file) = checked_file(&project_path, &file_path)?;
         let content = {
             let _guard = HISTORY_LOCK.lock().map_err(|e| e.to_string())?;

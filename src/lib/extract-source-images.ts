@@ -32,6 +32,21 @@ export interface SavedImage {
   sha256: string
 }
 
+export interface SourceImageFigureCaption {
+  /** Verbatim standalone numbered caption in the source Markdown. */
+  text: string
+  line: number
+  /** The caption's own adjacent marker; never borrowed from the image. */
+  sourceLocation: string | null
+}
+
+export interface ImageSourceEvidence {
+  sourcePath: string
+  line: number
+  sourceLocation: string | null
+  figureCaption?: SourceImageFigureCaption
+}
+
 /** File extensions we currently extract images from. Excludes XLS/XLSX
  *  because spreadsheets generally don't have charts as images (charts
  *  are XML-rendered shapes, not embedded raster). Adding them later is
@@ -291,6 +306,7 @@ export async function extractAndSaveMarkdownImages(
 export function buildImageMarkdownSection(
   images: SavedImage[],
   captionsBySha?: Map<string, string>,
+  sourceEvidence?: Map<string, ImageSourceEvidence>,
 ): string {
   if (images.length === 0) return ""
 
@@ -333,8 +349,20 @@ export function buildImageMarkdownSection(
       // — the inline LLM-generated text might cite the image by
       // page number anyway.
       const caption = captionsBySha?.get(img.sha256)
-      const alt = caption ? sanitize(caption) : ""
+      const evidence = sourceEvidence?.get(img.relPath)
+      const figure = evidence?.figureCaption
+      // Retrieval scores passage bodies independently from headings. Keep the
+      // original figure number/title with its cached description in one alt.
+      const alt = sanitize([figure?.text, caption].filter(Boolean).join("；"))
+      if (evidence) lines.push(`<!-- source-location: ${evidence.sourceLocation ?? "unknown"} -->`)
       lines.push(`![${alt}](${img.relPath})`)
+      if (evidence) lines.push("", `出处：[[${evidence.sourcePath}]]，行 ${evidence.line}；${evidence.sourceLocation ?? "unknown"}。`, "<!-- source-location: unknown -->", "")
+      if (figure && evidence) lines.push(
+        `<!-- source-location: ${figure.sourceLocation ?? "unknown"} -->`,
+        figure.text, "",
+        `图题出处：[[${evidence.sourcePath}]]，行 ${figure.line}；${figure.sourceLocation ?? "unknown"}。`,
+        "<!-- source-location: unknown -->", "",
+      )
     }
     lines.push("")
   }

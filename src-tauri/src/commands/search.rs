@@ -20,6 +20,9 @@ const TITLE_TOKEN_WEIGHT: f64 = 5.0;
 const CONTENT_TOKEN_WEIGHT: f64 = 1.0;
 const SNIPPET_CONTEXT: usize = 80;
 const SEARCH_EMBEDDING_TIMEOUT_SECS: u64 = 8;
+// Indexing sends up to 64 chunks, unlike one interactive query. Local models
+// need time to process that batch; page indexing also has an outer 300s budget.
+const BATCH_EMBEDDING_TIMEOUT_SECS: u64 = 120;
 const MAX_SEARCH_FILES: usize = 10_000;
 const MIN_GRAPH_RESULT_RATIO: f64 = 0.15;
 const MAX_GRAPH_RESULT_RATIO: f64 = 0.30;
@@ -331,9 +334,19 @@ pub async fn search_project_inner(
     include_content: bool,
     query_embedding: Option<Vec<f32>>,
 ) -> Result<ProjectSearchResponse, String> {
+    search_project_inner_scoped(project_path, query, top_k, include_content, query_embedding, None).await
+}
+
+pub async fn search_project_inner_scoped(
+    project_path: String, query: String, top_k: usize, include_content: bool,
+    query_embedding: Option<Vec<f32>>, allowed_pages: Option<BTreeSet<String>>,
+) -> Result<ProjectSearchResponse, String> {
     if query.trim().is_empty() {
         return Err("query is required".to_string());
     }
+    // The vector store has no source predicate. Scoped searches stay lexical
+    // instead of ranking globally or trusting ambiguous legacy basename IDs.
+    let query_embedding = if allowed_pages.is_some() { None } else { query_embedding };
     let limit = top_k.clamp(1, MAX_RESULTS);
     let tokens = tokenize_query(&query);
     let effective_tokens = if tokens.is_empty() {
@@ -372,6 +385,7 @@ pub async fn search_project_inner(
                 Err(_) => continue,
             };
             let relative_path = relative_to_project(&project_path, entry.path());
+            if allowed_pages.as_ref().is_some_and(|allowed| !allowed.contains(&relative_path)) { continue; }
             if let Some(vector_id) = vector_page_id(&relative_path) {
                 page_paths_by_vector_id.insert(vector_id, relative_path.clone());
             }
@@ -1223,7 +1237,7 @@ pub(crate) async fn fetch_embedding_batch(
     let endpoint = volcengine_embedding_endpoint(cfg);
     let mut req = crate::proxy::configure_http_client(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(
-            SEARCH_EMBEDDING_TIMEOUT_SECS,
+            BATCH_EMBEDDING_TIMEOUT_SECS,
         ))
         .build()
         .map_err(|e| format!("Embedding HTTP client error: {e}"))?
@@ -2120,6 +2134,29 @@ mod tests {
         assert_eq!(graph_result_quota(20, 10), 5);
         assert_eq!(graph_result_quota(20, 20), 3);
         assert_eq!(graph_result_quota(10, 100), 2);
+    }
+
+    #[tokio::test]
+    async fn scoped_search_does_not_remap_legacy_vectors_or_fetch_outside_chunks() {
+        let root = tmp_project();
+        write_page(&root, "wiki/a/claim.md", "# Allowed\n\nallowed literal evidence");
+        write_page(&root, "wiki/b/claim.md", "# Other\n\noutside evidence");
+        let project = root.to_string_lossy().to_string();
+        let embedding = vec![1.0, 0.0, 0.0, 0.0];
+        vectorstore::vector_upsert_chunks(project.clone(), "claim".into(), vec![vectorstore::ChunkUpsertInput {
+            chunk_index:0, chunk_text:"OUTSIDE_VECTOR_BODY".into(), heading_path:"Other".into(), embedding:embedding.clone(),
+        }]).await.unwrap();
+        let control = vectorstore::vector_search_chunks(project.clone(), embedding.clone(), 10).await.unwrap();
+        assert!(control.iter().any(|r| r.chunk_text == "OUTSIDE_VECTOR_BODY"));
+        let allowed = BTreeSet::from(["wiki/a/claim.md".to_string()]);
+        let result = search_project_inner_scoped(project.clone(), "absentneedle".into(), 5, false, Some(embedding.clone()), Some(allowed.clone())).await.unwrap();
+        assert!(result.results.is_empty());
+        assert_eq!(result.vector_hits,0);
+        let result = search_project_inner_scoped(project, "literal".into(), 5, false, Some(embedding), Some(allowed)).await.unwrap();
+        assert_eq!(result.results.len(),1);
+        assert_eq!(result.results[0].path,"wiki/a/claim.md");
+        assert!(!result.results[0].snippet.contains("OUTSIDE_VECTOR_BODY"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

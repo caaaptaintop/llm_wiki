@@ -775,7 +775,6 @@ function assertBigModelImageSupport(config: LlmConfig, messages: ChatMessage[]):
 }
 
 export function supportsImageInput(config: LlmConfig): boolean {
-  if (config.provider === "codex-cli") return false
   if (config.provider === "minimax") return isMiniMaxM3Model(config.model)
   if (isBigModelEndpoint(config)) return isGlmVisionModel(config.model)
   if ((config.provider === "custom") && (config.apiMode ?? "chat_completions") === "anthropic_messages") {

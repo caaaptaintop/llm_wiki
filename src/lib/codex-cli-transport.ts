@@ -33,14 +33,38 @@ export function parseCodexCliLine(rawLine: string): string | null {
   return typeof item.text === "string" && item.text.length > 0 ? item.text : null
 }
 
-function contentToText(content: string | ContentBlock[]): string {
-  if (typeof content === "string") return content
-  return content
-    .map((block) => {
-      if (block.type === "text") return block.text
-      return `[Image omitted: ${block.mediaType}]`
-    })
-    .join("\n")
+// Keep these IPC bounds aligned with codex_cli.rs. Rust remains authoritative
+// for base64 canonicalization, actual image format, decoding and dimensions.
+const MAX_IMAGES = 4
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+const MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024
+const MAX_BASE64_LENGTH = 4 * Math.ceil(MAX_IMAGE_BYTES / 3)
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif"])
+type ImageAttachment = Pick<Extract<ContentBlock, { type: "image" }>, "mediaType" | "dataBase64">
+
+function collectImages(messages: ChatMessage[]): ImageAttachment[] {
+  const images: ImageAttachment[] = []
+  let totalBytes = 0
+  for (const message of messages) {
+    if (typeof message.content === "string") continue
+    for (const block of message.content) {
+      if (block.type !== "image") continue
+      if (images.length >= MAX_IMAGES) throw new Error(`Codex CLI accepts at most ${MAX_IMAGES} images`)
+      if (!IMAGE_TYPES.has(block.mediaType)) throw new Error("Codex CLI images must be PNG, JPEG or GIF")
+      const data = block.dataBase64
+      if (!data || data.length > MAX_BASE64_LENGTH || data.length % 4 !== 0
+        || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
+        throw new Error("Invalid or oversized Codex CLI image base64")
+      }
+      const bytes = data.length / 4 * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0)
+      totalBytes += bytes
+      if (bytes > MAX_IMAGE_BYTES || totalBytes > MAX_TOTAL_IMAGE_BYTES) {
+        throw new Error("Codex CLI image size limit exceeded (5 MiB each, 12 MiB total)")
+      }
+      images.push({ mediaType: block.mediaType, dataBase64: data })
+    }
+  }
+  return images
 }
 
 function escapePromptContent(text: string): string {
@@ -50,10 +74,14 @@ function escapePromptContent(text: string): string {
 }
 
 export function buildPrompt(messages: ChatMessage[]): string {
+  let imageIndex = 0
   return messages
     .map((message) => {
       const role = message.role.toUpperCase()
-      return `<${role}>\n${escapePromptContent(contentToText(message.content))}\n</${role}>`
+      const content = typeof message.content === "string" ? message.content : message.content
+        .map((block) => block.type === "text" ? block.text : `[Attached image ${++imageIndex}: ${block.mediaType}]`)
+        .join("\n")
+      return `<${role}>\n${escapePromptContent(content)}\n</${role}>`
     })
     .join("\n\n")
 }
@@ -62,6 +90,7 @@ type SpawnPayload = Record<string, unknown> & {
   streamId: string
   model: string
   prompt: string
+  images: ImageAttachment[]
   isolateLocalConfig: boolean
   timeoutMinutes?: number
   workingDirectory?: string
@@ -98,6 +127,13 @@ export async function streamCodexCli(
 
   const unparsedLines: string[] = []
   let unparsedSize = 0
+  const emitAgentMessage = (text: string) => {
+    // Each event is a complete message, not a token delta. Preserve the
+    // boundary so a later CLI status cannot join a document's closing marker.
+    if (emittedAgentMessage) onToken("\n\n")
+    emittedAgentMessage = true
+    onToken(text)
+  }
   function captureUnparsed(line: string) {
     if (unparsedSize >= 4096) return
     const trimmed = line.trim()
@@ -125,8 +161,7 @@ export async function streamCodexCli(
     for (const line of stdout.split(/\r?\n/)) {
       const token = parseCodexCliLine(line)
       if (token !== null) {
-        emittedAgentMessage = true
-        onToken(token)
+        emitAgentMessage(token)
       }
     }
   }
@@ -146,8 +181,7 @@ export async function streamCodexCli(
     unlistenData = await listen<string>(`codex-cli:${streamId}`, (event) => {
       const token = parseCodexCliLine(event.payload)
       if (token !== null) {
-        emittedAgentMessage = true
-        onToken(token)
+        emitAgentMessage(token)
       } else {
         captureUnparsed(event.payload)
       }
@@ -235,6 +269,7 @@ export async function streamCodexCli(
       streamId,
       model: config.model,
       prompt: buildPrompt(messages),
+      images: collectImages(messages),
       isolateLocalConfig: config.localCliIsolation === true,
       timeoutMinutes: config.codexCliTimeoutMinutes,
       workingDirectory,

@@ -482,7 +482,7 @@ fn leading_frontmatter(content: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
-fn strip_frontmatter(content: &str) -> &str {
+pub(crate) fn strip_frontmatter(content: &str) -> &str {
     let Some(rest) = content.strip_prefix("---\n") else {
         return content;
     };

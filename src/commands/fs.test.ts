@@ -8,7 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: mocks.invoke,
 }))
 
-import { createDirectory, listDirectory, writeFile, writeFileAtomic } from "./fs"
+import { createDirectory, listDirectory, writeFile, writeFileAtomic, writeSourceImagesIfUnchanged } from "./fs"
 
 describe("fs command path guards", () => {
   beforeEach(() => {
@@ -28,6 +28,19 @@ describe("fs command path guards", () => {
       /absolute path/i,
     )
 
+    expect(mocks.invoke).not.toHaveBeenCalled()
+  })
+
+  it("routes image-only writes to the narrow native source image CAS command", async () => {
+    mocks.invoke.mockResolvedValue(undefined)
+    await writeSourceImagesIfUnchanged("/tmp/project", "wiki/sources/guide.md", "before", "next")
+    expect(mocks.invoke).toHaveBeenCalledWith("write_source_images_if_unchanged", {
+      projectPath: "/tmp/project", relativePath: "wiki/sources/guide.md", expected: "before", contents: "next",
+    })
+  })
+
+  it("rejects a relative source image project before native invocation", async () => {
+    await expect(writeSourceImagesIfUnchanged("project", "wiki/sources/guide.md", "before", "next")).rejects.toThrow(/absolute path/i)
     expect(mocks.invoke).not.toHaveBeenCalled()
   })
 

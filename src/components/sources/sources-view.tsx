@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Link, ExternalLink, Search, X } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Link, ExternalLink, Search, X, Info } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -24,11 +24,13 @@ import {
   type SourceImportResult,
 } from "@/lib/source-lifecycle"
 import { filterRawSourceTree } from "@/lib/source-filter"
+import { isPreparedSourceArtifact } from "@/lib/prepared-source"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { importSourceUrls, parseImportUrls, type UrlImportResult } from "@/lib/url-source-import"
 import { listIngestedSourceIdentities } from "@/lib/ingest-cache"
 import { getQueue, subscribeIngestQueue, type IngestTask } from "@/lib/ingest-queue"
+import { SourceProcessingDialog } from "./source-processing-dialog"
 
 const SOURCE_TREE_INITIAL_ROWS = 160
 const SOURCE_TREE_LOAD_BATCH = 160
@@ -59,6 +61,13 @@ export function SourcesView() {
   const [ingestedIdentities, setIngestedIdentities] = useState<string[]>([])
   const [queueSnapshot, setQueueSnapshot] = useState<IngestTask[]>(() => [...getQueue()])
   const [sourceQuery, setSourceQuery] = useState("")
+  const [processingSource, setProcessingSource] = useState<{
+    projectId: string; projectPath: string; node: FileNode
+  } | null>(null)
+  const [ingestError, setIngestError] = useState<{
+    projectId: string; sourcePath: string; message: string
+  } | null>(null)
+  const enqueueInFlight = useRef(false)
   /**
    * Path of the source-tree node currently in "click again to
    * confirm delete" state. Lifted up here (rather than living
@@ -87,7 +96,7 @@ export function SourcesView() {
     const pp = normalizePath(project.path)
     try {
       const tree = await listDirectory(`${pp}/raw/sources`, true)
-      setSources(filterRawSourceTree(tree))
+      setSources(filterPreparedSourceArtifacts(filterRawSourceTree(tree)))
       setRefreshError(null)
     } catch (err) {
       setRefreshError(String(err))
@@ -101,7 +110,9 @@ export function SourcesView() {
 
   useEffect(() => {
     setSourceQuery("")
-  }, [project?.id])
+    setProcessingSource(null)
+    setIngestError(null)
+  }, [project?.id, project?.path])
 
   useEffect(() => {
     if (!project) {
@@ -353,8 +364,16 @@ export function SourcesView() {
     }
   }
 
-  async function handleIngest(node: FileNode) {
-    if (!project || ingestingPath) return
+  async function handleIngest(node: FileNode, mode: "full" | "images-only" = "full") {
+    if (!project || enqueueInFlight.current) return
+    const pp = normalizePath(project.path)
+    const alreadyQueued = getQueue().some((task) => {
+      const path = normalizePath(task.sourcePath)
+      const absolutePath = path.startsWith("/") || /^[A-Za-z]:\//.test(path) ? path : `${pp}/${path}`
+      return task.projectId === project.id && absolutePath === normalizePath(node.path)
+        && (task.status === "pending" || task.status === "processing")
+    })
+    if (alreadyQueued) return
     // Re-ingest goes through the same automated queue path as a fresh
     // import (`handleImport` above). Earlier this used `startIngest`,
     // which opens an interactive chat → user clicks "Save to Wiki" →
@@ -362,12 +381,19 @@ export function SourcesView() {
     // the auto-pipeline so features like image cascade had to be
     // wired in twice, and (b) the interactive flow surprised users
     // who expected a fresh-import re-run. One button, one path now.
+    enqueueInFlight.current = true
     setIngestingPath(node.path)
+    setIngestError(null)
     try {
-      await enqueueSourceIngest(project, [node.path], llmConfig)
+      const tasks = await enqueueSourceIngest(project, [node.path], llmConfig, { mode })
+      if (tasks.length === 0) throw new Error(t("sources.processing.notQueued", "未加入处理队列，请检查入库模型配置及来源格式。"))
     } catch (err) {
       console.error("Failed to enqueue ingest:", err)
+      if (useWikiStore.getState().project?.id === project.id && useWikiStore.getState().project?.path === project.path) {
+        setIngestError({ projectId: project.id, sourcePath: node.path, message: String(err) })
+      }
     } finally {
+      enqueueInFlight.current = false
       setIngestingPath(null)
     }
   }
@@ -410,6 +436,27 @@ export function SourcesView() {
           </Button>
         </div>
       </div>
+
+      <p className="shrink-0 border-b bg-muted/20 px-4 py-3 text-xs leading-relaxed text-muted-foreground">{t("sources.importHint")}</p>
+
+      {project && processingSource?.projectId === project.id && processingSource.projectPath === project.path && (
+        <SourceProcessingDialog
+          key={`${project.id}:${project.path}:${processingSource.node.path}`}
+          projectPath={project.path}
+          sourcePath={processingSource.node.path}
+          sourceName={processingSource.node.name}
+          ingestStatus={sourceStatuses.get(normalizePath(processingSource.node.path)) ?? "not-ingested"}
+          enqueueing={ingestingPath !== null}
+          ingestError={ingestError?.projectId === project.id && ingestError.sourcePath === processingSource.node.path ? ingestError.message : null}
+          queueError={[...queueSnapshot].reverse().find((task) => task.projectId === project.id
+            && normalizePath(task.sourcePath).replace(`${normalizePath(project.path)}/`, "")
+              === normalizePath(processingSource.node.path).slice(normalizePath(project.path).length + 1)
+            && task.status !== "done")?.error ?? null}
+          onClose={() => setProcessingSource(null)}
+          onImagesOnly={() => void handleIngest(processingSource.node, "images-only")}
+          onIngest={() => void handleIngest(processingSource.node)}
+        />
+      )}
 
       <Dialog open={urlDialogOpen} onOpenChange={setUrlDialogOpen}>
         <DialogContent className="sm:max-w-lg">
@@ -478,6 +525,11 @@ export function SourcesView() {
       )}
 
       <ScrollArea className="min-h-0 flex-1 overflow-hidden">
+        {ingestError && ingestError.projectId === project?.id && (
+          <p role="alert" className="mx-4 mt-3 break-words rounded-md border border-destructive/30 px-3 py-2 text-xs text-destructive">
+            {ingestError.message}
+          </p>
+        )}
         {refreshError && (
           <div className="mx-4 mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {t("sources.refreshFailed", {
@@ -540,7 +592,6 @@ export function SourcesView() {
         {sources.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-3 p-8 text-center text-sm text-muted-foreground">
             <p>{t("sources.noSources")}</p>
-            <p>{t("sources.importHint")}</p>
             <div className="flex gap-2">
               <Button variant="outline" size="sm" onClick={handleImport}>
                 <Plus className="mr-1 h-4 w-4" />
@@ -563,6 +614,9 @@ export function SourcesView() {
               onOpen={handleOpenSource}
               onOpenExternal={handleOpenSourceExternally}
               onIngest={handleIngest}
+              onProcessingDetails={(node) => {
+                if (project) setProcessingSource({ projectId: project.id, projectPath: project.path, node })
+              }}
               onDelete={handleDelete}
               onDeleteFolder={handleDeleteFolder}
               pendingDeletePath={pendingDeletePath}
@@ -624,6 +678,20 @@ function countFiles(nodes: FileNode[]): number {
     }
   }
   return count
+}
+
+/** Sources shows managed bundles as one source; the file view keeps all assets. */
+export function filterPreparedSourceArtifacts(nodes: FileNode[]): FileNode[] {
+  return nodes.flatMap((node) => {
+    if (isPreparedSourceArtifact(node.path)) return []
+    if (!node.is_dir) return [node]
+    const children = filterPreparedSourceArtifacts(node.children ?? [])
+    if (children.length > 0) return [{ ...node, children }]
+    // Only prune a newly emptied ancestor or an empty managed package root.
+    // Reuse the artifact classifier on an auxiliary child to identify the root.
+    if (node.children?.length || isPreparedSourceArtifact(`${node.path}/manifest.json`)) return []
+    return [node]
+  })
 }
 
 export interface ImportOutcome {
@@ -697,6 +765,7 @@ function SourceTree({
   onOpen,
   onOpenExternal,
   onIngest,
+  onProcessingDetails,
   onDelete,
   onDeleteFolder,
   pendingDeletePath,
@@ -709,6 +778,7 @@ function SourceTree({
   onOpen: (node: FileNode) => void
   onOpenExternal: (node: FileNode) => void
   onIngest: (node: FileNode) => void
+  onProcessingDetails: (node: FileNode) => void
   onDelete: (node: FileNode) => void
   onDeleteFolder: (node: FileNode) => void
   /** Path of the node currently in "click again to confirm" state.
@@ -845,6 +915,16 @@ function SourceTree({
                 {t(`sources.ingestStatus.${ingestStatus}`)}
               </span>
             </button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 shrink-0"
+              title={t("sources.processing.details", "处理详情")}
+              aria-label={t("sources.processing.details", "处理详情")}
+              onClick={() => onProcessingDetails(node)}
+            >
+              <Info className="h-4 w-4" />
+            </Button>
             <Button
               variant="ghost"
               size="icon"

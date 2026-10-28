@@ -9,6 +9,9 @@ mod server_bind;
 mod tray;
 mod types;
 
+#[cfg(test)]
+mod retrieval_validation;
+
 use panic_guard::run_guarded;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -59,6 +62,13 @@ fn api_server_reload_config() -> String {
         Ok("ok".to_string())
     })
     .unwrap_or_else(|e| format!("error: {e}"))
+}
+
+#[tauri::command]
+async fn agent_list_sources(app: tauri::AppHandle, project_id: String) -> Result<Vec<Value>, String> {
+    let project = resolve_agent_project(&app, &project_id)?;
+    tauri::async_runtime::spawn_blocking(move || agent::tools::source_catalog(&project.path))
+        .await.map_err(|e| format!("source catalog failed: {e}"))
 }
 
 #[tauri::command]
@@ -626,6 +636,8 @@ pub fn run() {
             commands::fs::write_file,
             commands::fs::write_file_base64,
             commands::fs::write_file_atomic,
+            commands::fs::write_wiki_file_if_unchanged,
+            commands::fs::write_source_images_if_unchanged,
             commands::fs::apply_text_selection_edit,
             commands::fs::create_missing_wiki_page,
             commands::file_history::list_file_history,
@@ -636,6 +648,7 @@ pub fn run() {
             commands::file_history::clear_file_history,
             commands::fs::list_directory,
             commands::fs::copy_file,
+            commands::fs::copy_file_verified_atomic,
             commands::fs::copy_directory,
             commands::fs::preprocess_file,
             commands::fs::delete_file,
@@ -663,6 +676,7 @@ pub fn run() {
             api_server_status,
             api_server_reload_config,
             agent_start_turn,
+            agent_list_sources,
             agent_start_turn_stream,
             agent_cancel_turn,
             agent_get_session,

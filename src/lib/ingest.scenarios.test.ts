@@ -268,7 +268,7 @@ describe("ingest scenarios (fixture-driven)", () => {
     expect(commitCalls).toBe(1)
     expect(cachedWritten).toEqual(firstWritten)
     const activities = useActivityStore.getState().items
-    expect(activities.some((item) => item.detail.includes("Skipped (unchanged)"))).toBe(true)
+    expect(activities.some((item) => item.detail.includes("复用已有入库结果"))).toBe(true)
   })
 
   it("serializes concurrent ingestion of the same source and reuses its cache", async () => {
@@ -284,7 +284,7 @@ describe("ingest scenarios (fixture-driven)", () => {
     expect(streamCallCount).toBe(2)
     expect(secondWritten).toEqual(firstWritten)
     const activities = useActivityStore.getState().items
-    expect(activities.some((item) => item.detail.includes("Skipped (unchanged)"))).toBe(true)
+    expect(activities.some((item) => item.detail.includes("复用已有入库结果"))).toBe(true)
   })
 
   it("drops generated pages whose frontmatter type disagrees with schema routing", async () => {

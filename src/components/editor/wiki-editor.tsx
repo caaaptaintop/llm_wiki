@@ -363,8 +363,9 @@ export function WikiEditor({ content, onSave, filePath }: WikiEditorProps) {
 
       {mode === "read" ? (
         <div ref={readerRef} className="h-full overflow-auto px-6 py-6" onMouseUp={captureRenderedSelection}>
-          {frontmatter && <StableFrontmatterPanel data={frontmatter} />}
+          {frontmatter && <StableFrontmatterPanel key={`metadata:${filePath}`} data={frontmatter} titleInBody={/^\s*#\s+(.+?)(?:\s+#+)?\s*(?:\n|$)/.exec(body)?.[1] === frontmatter.title} />}
           <StableWikiReader
+            key={`reader:${filePath}`}
             body={body}
             sourceBody={bodySourceOffset >= 0 ? body : undefined}
             sourceOffset={bodySourceOffset >= 0 ? bodySourceOffset : undefined}

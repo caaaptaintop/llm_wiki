@@ -399,16 +399,30 @@ describe("captionMarkdownImages", () => {
     expect(mockReadBase64).toHaveBeenCalledWith("/custom/anchor/media/foo/img-1.png")
   })
 
-  it("skips Codex CLI captioning once before reading image bytes", async () => {
+  it("uses the existing caption/cache pipeline for Codex CLI images", async () => {
+    mockReadBase64.mockResolvedValue({ base64: "AAAA", mimeType: "image/png" })
+    mockCaption.mockResolvedValue("图中显示进度对比")
     const out = await captionMarkdownImages("/proj", "![](/abs/a.png)\n![](/abs/b.png)", {
       ...cfg,
       provider: "codex-cli",
     })
 
-    expect(out.enrichedMarkdown).toBe("![](/abs/a.png)\n![](/abs/b.png)")
-    expect(out.failed).toBe(2)
-    expect(mockReadBase64).not.toHaveBeenCalled()
-    expect(mockCaption).not.toHaveBeenCalled()
+    expect(out.enrichedMarkdown).toContain("![图中显示进度对比]")
+    expect(out.failed).toBe(0)
+    expect(out.freshCaptions).toBe(1)
+    expect(out.cachedCaptions).toBe(1)
+    expect(mockCaption).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not cache an empty or cancelled caption as a successful image", async () => {
+    mockReadBase64.mockResolvedValue({ base64: "AAAA", mimeType: "image/png" })
+    mockCaption.mockResolvedValue("")
+    expect((await captionMarkdownImages("/proj", "![](/abs/a.png)", cfg)).failed).toBe(1)
+    expect(mockWriteFile).not.toHaveBeenCalled()
+    const ctl = new AbortController()
+    mockCaption.mockImplementation(async () => { ctl.abort(); return "partial" })
+    await expect(captionMarkdownImages("/proj", "![](/abs/a.png)", cfg, { signal: ctl.signal })).rejects.toThrow()
+    expect(mockWriteFile).not.toHaveBeenCalled()
   })
 
   it("forwards AbortSignal to captionImage", async () => {

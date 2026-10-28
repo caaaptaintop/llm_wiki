@@ -1594,3 +1594,88 @@ describe("cleanupWrittenFiles — page cascade", () => {
     )
   })
 })
+
+describe("ingest-queue — explicit image recovery mode", () => {
+  it("deduplicates pending tasks by source and mode, leaving a failed full task intact", async () => {
+    pauseProcessing()
+    const fullId = await enqueueIngest(TEST_ID, "raw/sources/guide.md")
+    const full = getQueue().find(task => task.id === fullId)!
+    full.status = "failed"
+    full.error = "逐节知识已被修改"
+    const imageId = await enqueueIngest(TEST_ID, "raw/sources/guide.md", "", "images-only")
+    const duplicate = await enqueueIngest(TEST_ID, "raw/sources/guide.md", "", "images-only")
+    expect(imageId).not.toBe(fullId)
+    expect(duplicate).toBe(imageId)
+    expect(full).toMatchObject({ status: "failed", error: "逐节知识已被修改", mode: "full" })
+    const pendingFull = await enqueueIngest(TEST_ID, "raw/sources/other.md")
+    const pendingImage = await enqueueIngest(TEST_ID, "raw/sources/other.md", "", "images-only")
+    expect(pendingFull).not.toBe(pendingImage)
+    expect(getQueue()).toHaveLength(4)
+  })
+
+  it("keeps an in-flight full run and its commit callback while independently queuing images-only", async () => {
+    const fullRun = createDeferred<string[]>()
+    mockAutoIngest.mockReturnValue(fullRun.promise)
+    const fullId = await enqueueIngest(TEST_ID, "raw/sources/guide.md")
+    await waitFor(() => mockAutoIngest.mock.calls.length === 1)
+    const options = mockAutoIngest.mock.calls[0][6]
+    const imageId = await enqueueIngest(TEST_ID, "raw/sources/guide.md", "", "images-only")
+    expect(imageId).not.toBe(fullId)
+    expect(getQueue().find(task => task.id === fullId)?.status).toBe("processing")
+    expect(getQueue().find(task => task.id === imageId)).toMatchObject({ mode: "images-only", status: "pending" })
+    expect(options).toMatchObject({ mode: "full", runCommit: expect.any(Function) })
+    expect(mockAutoIngest.mock.calls[0][3]?.aborted).toBe(false)
+    clearQueueState()
+    fullRun.resolve([])
+  })
+
+  it("persists and restores interrupted images-only tasks without changing legacy default mode", async () => {
+    pauseProcessing()
+    await enqueueIngest(TEST_ID, "raw/sources/guide.md", "", "images-only")
+    let persisted = mockWriteFile.mock.calls[mockWriteFile.mock.calls.length - 1][1]
+    expect(JSON.parse(persisted)[0].mode).toBe("images-only")
+    const tasks = JSON.parse(persisted)
+    tasks[0].status = "processing"
+    tasks.push({ ...tasks[0], id: "legacy", sourcePath: "raw/sources/legacy.md", mode: undefined, status: "failed" })
+    persisted = JSON.stringify(tasks)
+    clearQueueState()
+    mockReadFile.mockImplementation(async () => persisted)
+    mockWriteFile.mockImplementation(async (_path, data) => { persisted = data })
+    const run = createDeferred<string[]>()
+    mockAutoIngest.mockReturnValue(run.promise)
+    await restoreQueue(TEST_ID, TEST_PATH)
+    await waitFor(() => mockAutoIngest.mock.calls.length === 1)
+    expect(mockAutoIngest.mock.calls[0][6]).toMatchObject({ mode: "images-only", runCommit: expect.any(Function) })
+    expect(getQueue().find(task => task.id === "legacy")).toMatchObject({ status: "failed" })
+    expect(getQueue().find(task => task.id === "legacy")?.mode).toBeUndefined()
+    clearQueueState()
+    run.resolve([])
+  })
+
+  it("preserves mode on automatic and manual retry and does not run a text review sweep after image success", async () => {
+    mockAutoIngest.mockRejectedValueOnce(new Error("temporary image failure"))
+      .mockRejectedValueOnce(Object.assign(new Error("image failure"), { nonRetryable: true }))
+      .mockResolvedValueOnce(["wiki/sources/guide.md"])
+    const id = await enqueueIngest(TEST_ID, "raw/sources/guide.md", "", "images-only")
+    await waitFor(() => getQueue().find(task => task.id === id)?.status === "failed")
+    expect(mockAutoIngest).toHaveBeenCalledTimes(2)
+    await retryTask(id)
+    await waitFor(() => getQueue().length === 0)
+    expect(mockAutoIngest).toHaveBeenCalledTimes(3)
+    for (const call of mockAutoIngest.mock.calls) expect(call[6]?.mode).toBe("images-only")
+    await flushMicrotasks()
+    expect(mockSweep).not.toHaveBeenCalled()
+  })
+
+  it("does not revive a failed images-only task as a default full task for an inactive project", async () => {
+    mockReadFile.mockResolvedValue(JSON.stringify([{
+      id: "image-task", projectId: TEST_ID_B, sourcePath: "raw/sources/guide.md", folderContext: "",
+      mode: "images-only", status: "failed", error: "image failure", retryCount: 3, addedAt: 1,
+    }]))
+    await enqueueInactiveProjectBatch(TEST_ID_B, TEST_PATH_B, [{ sourcePath: "raw/sources/guide.md", folderContext: "" }])
+    const persisted = JSON.parse(mockWriteFile.mock.calls[mockWriteFile.mock.calls.length - 1][1])
+    expect(persisted).toHaveLength(2)
+    expect(persisted[0]).toMatchObject({ id: "image-task", mode: "images-only", status: "failed" })
+    expect(persisted[1]).toMatchObject({ mode: "full", status: "pending" })
+  })
+})

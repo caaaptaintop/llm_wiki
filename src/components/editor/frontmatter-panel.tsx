@@ -26,9 +26,12 @@ import {
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath } from "@/lib/path-utils"
 import { useTranslation } from "react-i18next"
+import { useReferenceTitles } from "@/hooks/use-reference-titles"
+import { referenceLabel } from "@/lib/reader-presentation"
 
 interface FrontmatterPanelProps {
   data: Record<string, FrontmatterValue>
+  titleInBody?: boolean
 }
 
 const TOP_LEVEL_KEYS = new Set([
@@ -42,7 +45,7 @@ const TOP_LEVEL_KEYS = new Set([
   "origin",
 ])
 
-export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
+export function FrontmatterPanel({ data, titleInBody = false }: FrontmatterPanelProps) {
   const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const projectPathIndex = useWikiStore((s) => s.projectPathIndex)
@@ -54,7 +57,6 @@ export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
   const description = stringValue(data.description)
   const origin = stringValue(data.origin)
   const tags = arrayValue(data.tags)
-  const sources = arrayValue(data.sources)
   const related = arrayValue(data.related)
 
   const extras = useMemo(
@@ -71,6 +73,40 @@ export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
   const projectPath = project ? normalizePath(project.path) : null
   const wikiRoot = projectPath ? `${projectPath}/wiki` : null
   const sourcesRoot = projectPath ? `${projectPath}/raw/sources` : null
+  // Different legacy references may resolve to one file. Dedupe only exact
+  // resolved identities; equal titles must never merge distinct sources.
+  const sources = useMemo(() => {
+    const seen = new Set<string>()
+    return arrayValue(data.sources).filter(source => {
+      const target = resolveSourceReference(projectPathIndex, unwrapWikilink(source).slug, sourcesRoot)
+      const key = target.kind === "local" ? `local:${normalizePath(target.path)}`
+        : target.kind === "external" ? `url:${target.url}` : `missing:${source}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  }, [data.sources, projectPathIndex, sourcesRoot])
+  const titlePaths = useMemo(() => {
+    const paths: string[] = []
+    if (!projectPath) return paths
+    for (const source of arrayValue(data.sources)) {
+      const target = resolveSourceReference(projectPathIndex, unwrapWikilink(source).slug, `${projectPath}/raw/sources`)
+      if (target.kind === "local" && normalizePath(target.path).startsWith(`${projectPath}/`)) paths.push(target.path)
+    }
+    for (const related of arrayValue(data.related)) {
+      const target = resolveRelatedSlug(projectPathIndex, related, `${projectPath}/wiki`)
+      if (target) paths.push(target)
+    }
+    for (const [, value] of extras) {
+      for (const entry of Array.isArray(value) ? value : [value]) {
+        if (!/^\[\[[^\[\]\n]+\]\]$/.test(entry)) continue
+        const target = resolveRelatedSlug(projectPathIndex, unwrapWikilink(entry).slug, `${projectPath}/wiki`)
+        if (target) paths.push(target)
+      }
+    }
+    return paths
+  }, [data, extras, projectPath, projectPathIndex])
+  const titles = useReferenceTitles(titlePaths)
 
   const typeStyle = getWikiTypeStyle(type)
   const TypeIcon = typeStyle.icon
@@ -103,7 +139,7 @@ export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
           <TypeIcon className="h-5 w-5" />
         </div>
         <div className="min-w-0 flex-1">
-          {title && (
+          {title && !titleInBody && (
             <div className="truncate text-base font-semibold leading-tight text-foreground">
               {title}
             </div>
@@ -150,10 +186,10 @@ export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
 
       {/* Sources card row ───────────────────────────────────────── */}
       {sources.length > 0 && (
-        <div className="px-4 pt-4">
+        <div className="px-4 pt-2">
           <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
             <Layers className="h-3.5 w-3.5" />
-            Sources
+            {t("reader.sources", { defaultValue: "Sources" })}
             <span className="text-muted-foreground/60">({sources.length})</span>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -173,7 +209,8 @@ export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
               return (
                 <SourceCard
                   key={source}
-                  name={label}
+                  name={label === slug && resolution.kind === "local" ? referenceLabel(slug, titles[resolution.path]) : label}
+                  reference={source}
                   status={resolution.kind}
                   externalUrl={resolution.kind === "external" ? resolution.url : undefined}
                   onClick={onClick}
@@ -186,10 +223,10 @@ export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
 
       {/* Related chips ──────────────────────────────────────────── */}
       {related.length > 0 && (
-        <div className="px-4 pt-4">
+        <div className="px-4 pt-2">
           <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
             <ArrowUpRight className="h-3.5 w-3.5" />
-            Related
+            {t("reader.related", { defaultValue: "Related" })}
             <span className="text-muted-foreground/60">({related.length})</span>
           </div>
           <div className="flex flex-wrap gap-1.5">
@@ -201,7 +238,7 @@ export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
               return (
                 <RelatedChip
                   key={entry}
-                  slug={label}
+                  slug={label === slug ? referenceLabel(slug, titles[path ?? ""]) : label}
                   resolved={!!path}
                   onClick={() => handleNavigate(path)}
                 />
@@ -213,21 +250,35 @@ export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
 
       {/* Extras (any other key/values we didn't surface above) ──── */}
       {extras.length > 0 && (
-        <div className="mx-4 mt-4 rounded border border-border/40 bg-background/50 px-3 py-2 text-xs">
-          <div className="mb-1 font-medium text-muted-foreground/80">{t("editor.frontmatter.more")}</div>
-          <div className="space-y-0.5">
+        <details className="mx-4 mt-2 text-xs text-muted-foreground">
+          <summary className="cursor-pointer select-none font-medium hover:text-foreground">{t("reader.maintenance", { defaultValue: "Page metadata" })}</summary>
+          <div className="mt-2 space-y-0.5 rounded border border-border/40 bg-background/50 px-3 py-2">
             {extras.map(([k, v]) => (
               <div key={k} className="flex gap-2">
                 <span className="shrink-0 font-mono text-muted-foreground">
                   {k}:
                 </span>
-                <span className="text-foreground/80">
-                  {Array.isArray(v) ? v.join(", ") : v}
+                <span className="flex min-w-0 flex-wrap items-center gap-1 text-foreground/80">
+                  {(Array.isArray(v) ? v : [v]).map((entry, index) => {
+                    if (!/^\[\[[^\[\]\n]+\]\]$/.test(entry)) {
+                      return <span key={index}>{index > 0 ? ", " : ""}{entry}</span>
+                    }
+                    const { slug, label } = unwrapWikilink(entry)
+                    const path = wikiRoot ? resolveRelatedSlug(projectPathIndex, slug, wikiRoot) : null
+                    return (
+                      <RelatedChip
+                        key={index}
+                        slug={label === slug ? referenceLabel(slug, titles[path ?? ""]) : label}
+                        resolved={!!path}
+                        onClick={() => handleNavigate(path)}
+                      />
+                    )
+                  })}
                 </span>
               </div>
             ))}
           </div>
-        </div>
+        </details>
       )}
 
       {/* Bottom padding — done via wrapper not last child to keep
@@ -240,11 +291,13 @@ export function FrontmatterPanel({ data }: FrontmatterPanelProps) {
 
 function SourceCard({
   name,
+  reference,
   status,
   externalUrl,
   onClick,
 }: {
   name: string
+  reference: string
   status: SourceReferenceResolution["kind"]
   externalUrl?: string
   onClick?: () => void
@@ -254,8 +307,8 @@ function SourceCard({
   const title = status === "external"
     ? `Open external source: ${externalUrl}`
     : status === "local"
-      ? `Open ${name}`
-      : `Source not found in raw/sources/: ${name}`
+      ? `Open ${name}\n${reference}`
+      : `Source not found in raw/sources/: ${reference}`
   return (
     <button
       type="button"

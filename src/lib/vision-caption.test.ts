@@ -142,14 +142,12 @@ describe("captionImage", () => {
     })
   })
 
-  it("rejects Codex CLI captioning because that transport omits image bytes", async () => {
-    await expect(
-      captionImage(TINY_B64, "image/png", {
-        ...cfg,
-        provider: "codex-cli",
-      }),
-    ).rejects.toThrow(/does not support image input/)
-    expect(mockStreamChat).not.toHaveBeenCalled()
+  it("passes Codex CLI the same image content blocks as other vision transports", async () => {
+    mockStreamChat.mockImplementation(async (_c, _m, cb) => { cb.onToken("红色方块"); cb.onDone() })
+    expect(await captionImage(TINY_B64, "image/png", { ...cfg, provider: "codex-cli" })).toBe("红色方块")
+    expect(mockStreamChat.mock.calls[0][1][0].content).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "image", mediaType: "image/png", dataBase64: TINY_B64 }),
+    ]))
   })
 
   it("forwards the AbortSignal to streamChat (lets callers cancel batch captioning)", async () => {
@@ -250,6 +248,8 @@ describe("captionImage", () => {
     expect(promptText).toMatch(/Text after image/)
     expect(promptText).toMatch(/MAY help describe the image/)
     expect(promptText).toMatch(/MAY ALSO be unrelated/)
+    expect(promptText).toMatch(/pair each time period, category or stage with its aligned labels and values/)
+    expect(promptText).toMatch(/visually unclear, say so instead of guessing/)
     // The actual context bytes round-trip through the prompt.
     expect(promptText).toContain("Figure 3: Q2 revenue chart")
     // Empty side becomes `(none)` so the structure is uniform.

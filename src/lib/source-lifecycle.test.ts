@@ -589,3 +589,15 @@ describe("source import skip reporting", () => {
     ])
   })
 })
+
+it("passes explicit images-only mode into the original queue without preprocessing text", async () => {
+  const queued = await enqueueSourceIngest(
+    { id: "p1", name: "Project", path: "/project" },
+    ["/project/raw/sources/notes.md"],
+    { provider: "openai", apiKey: "test", model: "test", maxContextSize: 128000 } as never,
+    { mode: "images-only" },
+  )
+  expect(queued).toEqual(["task"])
+  expect(mocks.preprocessFile).not.toHaveBeenCalled()
+  expect(mocks.enqueueBatch).toHaveBeenCalledWith("p1", [{ sourcePath: "/project/raw/sources/notes.md", folderContext: "", mode: "images-only" }])
+})
