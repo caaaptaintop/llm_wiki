@@ -1,3 +1,4 @@
+import { assertKnowledgeProse, WIKI_PROSE_RULES } from "./wiki-prose"
 import {
   createDirectory,
   deleteFile,
@@ -2389,6 +2390,13 @@ async function writeFileBlocks(
     //   quotes Russian philosophers) which confuses naive script-based
     //   detection. Keep the check for /concepts/ pages, which should be
     //   authoritative content in the target language.
+    if (!isLogPath(relativePath) && !isListingPath(relativePath) && !relativePath.startsWith("wiki/queries/")) {
+      try { assertKnowledgeProse(parseFrontmatter(content).body) } catch (error) {
+        warnings.push(`Dropped "${relativePath}" — ${String(error)}`)
+        hardFailures.push(relativePath)
+        continue
+      }
+    }
     const isLog = isLogPath(relativePath)
     const isEntityOrSource =
       relativePath.startsWith("wiki/entities/") ||
@@ -2461,6 +2469,7 @@ async function writeFileBlocks(
         // The merge unions existing frontmatter arrays, so sanitize again to
         // remove legacy/generated paths that may already be stored on disk.
         const toWrite = canonicalizeSourcesField(merged, sourceFileName)
+        if (!relativePath.startsWith("wiki/queries/")) assertKnowledgeProse(parseFrontmatter(toWrite).body)
         await writeFile(fullPath, toWrite)
       }
       writtenPaths.push(relativePath)
@@ -2613,6 +2622,7 @@ export function buildAnalysisPrompt(
   schema: string = "",
 ): string {
   return [
+    WIKI_PROSE_RULES,
     "You are an expert research analyst. Read the source document and produce a structured analysis.",
     "Do not output chain-of-thought, hidden reasoning, or a thinking transcript. Reason internally and write only the concise final analysis.",
     "",
@@ -2637,7 +2647,7 @@ export function buildAnalysisPrompt(
     "## Main Arguments & Findings",
     "- What are the core claims or results?",
     "- What evidence supports them?",
-    "- How strong is the evidence?",
+    "- Describe the source's evidence: study setting, sample, method and author-reported limitations. Keep your own verification questions in Recommendations, not in source claims.",
     "- Which named subject is each claim about? Do not transfer claims, limits, or evaluations from one entity/model/product/method to another just because they share keywords.",
     "- Preserve structured source data verbatim in the analysis when present: include SQL DDL / CREATE TABLE statements, schema definitions, API signatures, configuration, and tables in fenced code blocks or Markdown tables. Do not reduce exact field names, types, constraints, keys, or indexes to prose.",
     "",
@@ -2686,6 +2696,7 @@ export function buildGenerationPrompt(
 
   return [
     "You are a wiki maintainer. Based on the analysis provided, generate wiki files.",
+    WIKI_PROSE_RULES,
     "Do not output chain-of-thought, hidden reasoning, or explanatory preamble. Reason internally and output only the requested FILE/REVIEW blocks.",
     "",
     languageRule(sourceContent),
@@ -2768,9 +2779,9 @@ export function buildGenerationPrompt(
     "- Use kebab-case for Latin-script filenames; for Chinese/Japanese/Korean titles keep the CJK characters (do NOT romanize to pinyin/romaji or translate to English)",
     "- Derive filenames from the page title in the mandatory output language, but short proper nouns and technical identifiers take precedence: preserve names such as OpenAI, GPT-5, Transformer, CLIP, ImageNet, PyTorch, CUDA, GitHub, arXiv, React, LanceDB, AnyTXT, MinerU, model names, dataset names, tool names, and code identifiers in their standard original form. Do not put raw URLs, citation strings, or full paper titles directly into file paths; convert surrounding descriptive prose to a safe readable title. For Chinese/Japanese/Korean prose titles, keep readable CJK characters in the filename instead of translating the slug to English.",
     "- Preserve structured source data verbatim: copy SQL DDL / CREATE TABLE statements, schema definitions, API signatures, configuration, and tabular data into fenced code blocks (or Markdown tables) in the source summary page instead of paraphrasing them. Exact column names, types, constraints, primary/foreign keys, and indexes must survive ingest — a prose-only summary that drops them loses the structure the user imported the source to keep.",
-    "- Follow the analysis recommendations on what to emphasize",
+    "- Use analysis recommendations to organize source-backed knowledge. Do not promote the analyst's assessments, unknowns, tool/skill reports or verification checklist into FILE body claims. Put editorial follow-ups in REVIEW blocks. A query page may contain a substantive research question, not a software-maintenance task.",
     "- When a prepared-book context provides a chapter coverage list, include a separately titled note for every listed chapter in the source summary, followed by a whole-book overview. Keep chapter evidence attached to that chapter; chapter parts are not separate books. Retain the original source identity and valid location markers.",
-    "- If the analysis found connections to existing pages, add cross-references",
+    "- If the analysis found connections to existing pages, add navigation-only connections to frontmatter related. Use a body cross-reference when it is part of a source-backed explanation, never a paragraph about how this wiki should be linked.",
     "",
     "## Review block types",
     "",
@@ -3383,6 +3394,7 @@ export function buildChunkAnalysisSystemPrompt(
   sourceContent: string,
 ): string {
   return [
+    WIKI_PROSE_RULES,
     "You are analyzing a long source document for a personal wiki.",
     "Do not output chain-of-thought, hidden reasoning, or a thinking transcript.",
     "Analyze only the current MAIN CHUNK. Use overlap and digest for context only.",
@@ -3401,7 +3413,7 @@ export function buildChunkAnalysisSystemPrompt(
     "- Any schema-defined page types beyond entity/concept that the main chunk genuinely supports",
     "- Claims, findings, evidence, contradictions",
     "- Exact structured data from this chunk, when present: preserve SQL DDL / CREATE TABLE statements, schema definitions, API signatures, configuration, and tables verbatim in fenced code blocks or Markdown tables; retain field names, types, constraints, keys, and indexes",
-    "- Open questions or research gaps",
+    "- Open questions or research gaps explicitly raised by the source; label any analyst-only follow-up as editorial, never as source knowledge",
     "",
     "## Updated Global Digest",
     "A compact document-level digest that incorporates this chunk and preserves prior cross-chunk context.",
@@ -3677,12 +3689,13 @@ export function buildPageMerger(llmConfig: LlmConfig): MergeFn {
 
 export function buildPageMergeSystemPrompt(): string {
   return [
+    WIKI_PROSE_RULES,
     "You are merging source-backed material for the same wiki page into one coherent document.",
     "The inputs are internal containers, not revisions or competing versions.",
     "Either input may mention additional subjects for comparison or context.",
     "",
     "Output ONE merged version that:",
-    "- Preserves every factual claim from both inputs (do not drop content)",
+    "- Preserves every supported factual claim and its conditions from both inputs; do not preserve a demonstrably superseded extraction error as current knowledge. Keep genuine source disagreements attributed to their sources.",
     "- Eliminates redundancy when both inputs state the same fact",
     "- Preserves subject/source boundaries: if either input mentions other entities/models/products/methods for comparison, keep those comparisons attribution-exact and do not fold them into claims about the main page subject",
     "- When claims conflict or apply to different subjects, keep them separated; attribute a claim to a real source filename only when the supporting file is unambiguous, otherwise do not guess",

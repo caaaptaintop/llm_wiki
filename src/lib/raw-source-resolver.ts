@@ -101,7 +101,7 @@ export interface SourceMarkdownImageMatch {
 
 const SOURCE_LOCATION_LINE = /^<!-- source-location: ((?:pdf-page|epub-spine):[1-9]\d*\/block:[1-9]\d*|unknown) -->\s*$/
 // Require a numbered, standalone title, not a mention such as “见图 7-9”.
-const FIGURE_CAPTION_LINE = /^ {0,3}(?:图\s*|(?:Figure|Fig\.?)\s+)\d+(?:[.．\-–—]\d+)*(?:\s+|[:：]\s*|\.\s+)\S.*$/i
+const FIGURE_CAPTION_LINE = /^ {0,3}(?:图\s*|(?:Figure|Fig\.?)\s+)(\d+(?:[.．\-–—]\d+)*)(\s*[:：]\s*|\.\s+|\s+)\S.*$/i
 
 function adjacentFigureCaption(
   lines: string[], imageIndex: number, imageLines: Set<number>, captionLines: Set<number>,
@@ -113,8 +113,16 @@ function adjacentFigureCaption(
       && (!lines[index].trim() || SOURCE_LOCATION_LINE.test(lines[index]))) index += direction
     return index
   }
-  const candidates = [-1, 1].map((direction) => ({ direction, index: adjacent(imageIndex, direction) }))
+  let candidates = [-1, 1].map((direction) => ({ direction, index: adjacent(imageIndex, direction) }))
     .filter(({ index }) => captionLines.has(index))
+  if (candidates.length === 2) {
+    // A prose reference such as "Figure 2 depicts ..." can flank the image
+    // opposite "Figure 2: Title". Prefer that explicit title only when both
+    // refer to the same number; conflicting or equally explicit titles stay ambiguous.
+    const labels = candidates.map(({ index }) => FIGURE_CAPTION_LINE.exec(lines[index])!)
+    const delimited = candidates.filter((_, i) => /[:：.]/.test(labels[i][2]))
+    if (labels[0][1] === labels[1][1] && delimited.length === 1) candidates = delimited
+  }
   if (candidates.length !== 1) return undefined
   const { direction, index } = candidates[0]
   const otherSide = adjacent(index, direction)

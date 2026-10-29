@@ -11,6 +11,14 @@ function render(source: string) {
 }
 
 describe("source-location preview comments", () => {
+  it("hides managed image markers while preserving captions and code examples", () => {
+    const imageMarker = "<!-- llm-wiki:embedded-images -->"
+    const html = render(`Text.\n\n${imageMarker}\n\n![Figure 2: Sequence](images/sequence.jpg)\n\n${imageMarker}\n`)
+    expect(html).not.toContain("llm-wiki:embedded-images")
+    expect(html).toContain('alt="Figure 2: Sequence"')
+    expect(render(`\`\`\`markdown\n${imageMarker}\n\`\`\``)).toContain("&lt;!-- llm-wiki:embedded-images --&gt;")
+  })
+
   it("hides EPUB, PDF and unknown standalone markers while keeping prose and images", () => {
     const source = `${marker}\n# Chapter\n\n![cover](images/cover.jpg)\n\n<!-- source-location: pdf-page:7/block:2 -->\nA passage.\n${unknown}\nAnother passage.`
     const html = render(source)

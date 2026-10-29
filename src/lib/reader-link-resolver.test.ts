@@ -15,6 +15,13 @@ const index = buildProjectPathIndexFromTree([
 ])
 
 describe("resolveReaderLink", () => {
+  it("resolves root-relative source citations from a nested knowledge page without traversal", () => {
+    const raw = "/project/raw/sources/example/source.md"
+    const sourceIndex = buildProjectPathIndexFromTree([notes, raw].map(path => ({ name: path.split("/").pop()!, path, is_dir: false })))
+    expect(resolveReaderLink(sourceIndex, "raw/sources/example/source.md#L12", notes, root)).toEqual({ path: raw, anchor: "L12" })
+    expect(resolveReaderLink(sourceIndex, "raw/sources/../../wiki/books/book-id/revision/book-id-chapter-1.md", notes, root)).toBeNull()
+    expect(resolveReaderLink(sourceIndex, "raw/sources/missing.md", notes, root)).toBeNull()
+  })
   it("opens prepared raw-source wikilinks only inside the indexed sources directory", () => {
     const raw = "/project/raw/sources/指南/source.md"
     const sourceIndex = buildProjectPathIndexFromTree([

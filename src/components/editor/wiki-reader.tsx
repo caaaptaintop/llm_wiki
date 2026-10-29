@@ -28,6 +28,8 @@ interface WikiReaderProps {
   sourceBody?: string
   /** Character offset where sourceBody begins in the full Markdown file. */
   sourceOffset?: number
+  /** Number of source-file lines before sourceBody (for #L123 citations). */
+  sourceLineOffset?: number
   /**
    * Absolute path of the markdown file being rendered. Used to
    * resolve relative image references against the file's own
@@ -50,7 +52,7 @@ interface WikiReaderProps {
  * against the project's wiki tree and routed to the wiki preview,
  * giving the user single-click navigation between pages.
  */
-export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: WikiReaderProps) {
+export function WikiReader({ body, sourceBody, sourceOffset = 0, sourceLineOffset = 0, filePath }: WikiReaderProps) {
   const { t } = useTranslation()
   const appDialog = useAppDialog()
   const project = useWikiStore((s) => s.project)
@@ -79,6 +81,9 @@ export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: Wik
   }, [body, projectPath, projectPathIndex, filePath])
   const titlePaths = useMemo(() => [...referencePaths.values()], [referencePaths])
   const titles = useReferenceTitles(titlePaths)
+  const sourceReferences = useMemo(() => Object.fromEntries([...referencePaths]
+    .filter(([, target]) => projectPath && ["wiki/sources/", "raw/sources/"].some(dir => normalizePath(target).startsWith(`${projectPath}/${dir}`)))
+    .map(([ref]) => [`#${encodeURIComponent(ref)}`, ref])), [referencePaths, projectPath])
 
   // Image embeds (`![[…]]`) must be rewritten BEFORE the generic
   // wikilink pass, otherwise the embed target gets mangled into a
@@ -105,7 +110,8 @@ export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: Wik
     const start = sourceLineStarts[startLine - 1]
     const end = sourceLineStarts[endLine] ?? sourceBody?.length
     if (start === undefined || end === undefined) return {}
-    return { "data-source-start": sourceOffset + start, "data-source-end": sourceOffset + end }
+    return { "data-source-start": sourceOffset + start, "data-source-end": sourceOffset + end,
+      "data-source-line-start": sourceLineOffset + startLine, "data-source-line-end": sourceLineOffset + endLine }
   }
   const renderLanguage = detectLanguage(body)
   const direction = getTextDirection(renderLanguage)
@@ -122,13 +128,21 @@ export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: Wik
   useEffect(() => {
     if (!pendingHeading || pendingHeading.path !== filePath || selectedFile !== filePath) return
     const headings = readerRef.current?.querySelectorAll<HTMLElement>("h1,h2,h3,h4,h5,h6")
-    const target = headings && findReaderHeading(Array.from(headings), pendingHeading.anchor)
+    let target = headings && findReaderHeading(Array.from(headings), pendingHeading.anchor)
+    const line = /^L([1-9]\d*)$/.exec(pendingHeading.anchor)
+    if (!target && line && readerRef.current) {
+      const wanted = Number(line[1])
+      target = Array.from(readerRef.current.querySelectorAll<HTMLElement>("[data-source-line-start]"))
+        .filter(node => Number(node.dataset.sourceLineStart) <= wanted && Number(node.dataset.sourceLineEnd) >= wanted)
+        .sort((a, b) => (Number(a.dataset.sourceLineEnd) - Number(a.dataset.sourceLineStart))
+          - (Number(b.dataset.sourceLineEnd) - Number(b.dataset.sourceLineStart)))[0] ?? null
+    }
     // Preview content loads asynchronously. Keep the file-bound request until
     // its heading actually renders; later navigation clears stale requests.
     if (!target) return
     target.scrollIntoView({ behavior: "auto", block: "start" })
     setPendingHeading(null)
-  }, [pendingHeading, selectedFile, filePath, body, setPendingHeading])
+  }, [pendingHeading, selectedFile, filePath, body, sourceLineOffset, setPendingHeading])
 
   useEffect(() => {
     if (!pendingImage || !readerRef.current) return
@@ -310,7 +324,7 @@ export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: Wik
       style={{ textAlign: "start" }}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath, remarkCjkFriendly, [remarkReaderLayout, { evidenceLabel: t("reader.evidenceDetails", { defaultValue: "Evidence & source details" }) }], remarkHideSourceLocations, remarkReaderReferences]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkCjkFriendly, [remarkReaderLayout, { evidenceLabel: t("reader.evidenceDetails", { defaultValue: "Evidence & source details" }), sourceReferences }], remarkHideSourceLocations, remarkReaderReferences]}
         rehypePlugins={[rehypeKatex]}
         components={components}
       >

@@ -64,6 +64,13 @@ export function resolveReaderLink(
   // backslashes and nested escape encodings before resolving any segments.
   if (!relative || relative.startsWith("/") || /[:\\?]/.test(relative)
     || /%(?:2e|2f|5c|3a)/i.test(relative)) return null
+  // Older generated citations use project-root raw paths, even from a nested
+  // Wiki page. Resolve only that explicit namespace and an indexed source file.
+  if (relative.startsWith("raw/sources/")) {
+    if (relative.split("/").some(part => !part || part === "." || part === "..")) return null
+    const path = indexedFile(index, `${root}/${relative}`, `${root}/raw/sources`)
+    return path ? { path, anchor: anchor || null } : null
+  }
   const parts = current.slice(root.length + 1).split("/")
   parts.pop()
   for (const part of relative.split("/")) {

@@ -57,7 +57,6 @@ export function FrontmatterPanel({ data, titleInBody = false }: FrontmatterPanel
   const description = stringValue(data.description)
   const origin = stringValue(data.origin)
   const tags = arrayValue(data.tags)
-  const related = arrayValue(data.related)
 
   const extras = useMemo(
     () =>
@@ -73,6 +72,16 @@ export function FrontmatterPanel({ data, titleInBody = false }: FrontmatterPanel
   const projectPath = project ? normalizePath(project.path) : null
   const wikiRoot = projectPath ? `${projectPath}/wiki` : null
   const sourcesRoot = projectPath ? `${projectPath}/raw/sources` : null
+  const related = useMemo(() => {
+    const seen = new Set<string>()
+    return arrayValue(data.related).filter(entry => {
+      const target = wikiRoot ? resolveRelatedSlug(projectPathIndex, unwrapWikilink(entry).slug, wikiRoot) : null
+      const key = target ? `local:${normalizePath(target)}` : `missing:${entry}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  }, [data.related, projectPathIndex, wikiRoot])
   // Different legacy references may resolve to one file. Dedupe only exact
   // resolved identities; equal titles must never merge distinct sources.
   const sources = useMemo(() => {

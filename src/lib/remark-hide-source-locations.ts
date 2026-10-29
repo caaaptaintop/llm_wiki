@@ -15,7 +15,8 @@ export function remarkHideSourceLocations() {
       if (!parent.children) return
       parent.children = parent.children.filter((node) => !(blockParents.has(parent.type)
         && node.type === "html" && (sourceLocation.test(node.value?.trim() ?? "")
-          || knowledgeBoundary.test(node.value?.trim() ?? ""))))
+          || knowledgeBoundary.test(node.value?.trim() ?? "")
+          || node.value?.trim() === "<!-- llm-wiki:embedded-images -->")))
       parent.children.forEach(visit)
     }
     visit(tree)

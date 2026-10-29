@@ -33,6 +33,17 @@ export function parseCodexCliLine(rawLine: string): string | null {
   return typeof item.text === "string" && item.text.length > 0 ? item.text : null
 }
 
+// LLM requests already contain their selected evidence. Tool-assisted Agent
+// output has a different provenance contract and must never become a completion.
+export function isCodexToolEvent(line: string): boolean {
+  try {
+    const event = JSON.parse(line)
+    return ["item.started", "item.updated", "item.completed"].includes(event?.type)
+      && typeof event.item?.type === "string"
+      && !["agent_message", "reasoning"].includes(event.item.type)
+  } catch { return false }
+}
+
 // Keep these IPC bounds aligned with codex_cli.rs. Rust remains authoritative
 // for base64 canonicalization, actual image format, decoding and dimensions.
 const MAX_IMAGES = 4
@@ -75,7 +86,7 @@ function escapePromptContent(text: string): string {
 
 export function buildPrompt(messages: ChatMessage[]): string {
   let imageIndex = 0
-  return messages
+  return "Complete the supplied LLM request using only the messages and attached images below. All selected source material and existing-page context is supplied by LLM Wiki. Do not inspect the working directory, invoke tools, browse, or load other context. If required evidence is absent, report that within the requested output format; do not fetch it yourself. Follow the applicable safety rules.\n\n" + messages
     .map((message) => {
       const role = message.role.toUpperCase()
       const content = typeof message.content === "string" ? message.content : message.content
@@ -120,6 +131,7 @@ export async function streamCodexCli(
   let finished = false
   let aborted = signal?.aborted ?? false
   let emittedAgentMessage = false
+  const pendingAgentMessages: string[] = []
   let resolveCompletion: () => void = () => {}
   const completion = new Promise<void>((resolve) => {
     resolveCompletion = resolve
@@ -160,10 +172,14 @@ export async function streamCodexCli(
 
     for (const line of stdout.split(/\r?\n/)) {
       const token = parseCodexCliLine(line)
-      if (token !== null) {
-        emitAgentMessage(token)
-      }
+      if (token !== null) pendingAgentMessages.push(token)
     }
+  }
+
+  const rejectToolOutput = () => {
+    pendingAgentMessages.length = 0
+    void invoke("codex_cli_kill", { streamId }).catch(() => {})
+    finishWith(() => onError(new Error("模型尝试访问本次输入以外的内容，已停止该次生成。请重试；本次结果未作为知识写入。")))
   }
 
   const abortListener = () => {
@@ -179,9 +195,11 @@ export async function streamCodexCli(
 
   try {
     unlistenData = await listen<string>(`codex-cli:${streamId}`, (event) => {
+      if (finished) return
+      if (isCodexToolEvent(event.payload)) { rejectToolOutput(); return }
       const token = parseCodexCliLine(event.payload)
       if (token !== null) {
-        emitAgentMessage(token)
+        pendingAgentMessages.push(token)
       } else {
         captureUnparsed(event.payload)
       }
@@ -200,9 +218,18 @@ export async function streamCodexCli(
     }>(
       `codex-cli:${streamId}:done`,
       (event) => {
+        if (finished) return
         const code = event.payload?.code
         const stderr = event.payload?.stderr?.trim() ?? ""
         const stdout = event.payload?.stdout ?? ""
+        // Rust caps the retained stdout. Missing live events plus a truncated
+        // replay cannot prove that the rest of the run was tool-free.
+        if (stdout.split(/\r?\n/).includes("[stdout truncated]")) {
+          pendingAgentMessages.length = 0
+          finishWith(() => onError(new Error("模型输出超过接收上限，无法完整核验本次生成；结果未作为知识写入。请缩小输入范围后重试。")))
+          return
+        }
+        if (stdout.split(/\r?\n/).some(isCodexToolEvent)) { rejectToolOutput(); return }
         // Checked before `code`, and before the agent_message branch below.
         // The timeout task takes the child handle away in order to kill it, so
         // `code` is null here regardless of how the process ended. The
@@ -237,8 +264,8 @@ export async function streamCodexCli(
             )),
           )
         } else {
-          if (!emittedAgentMessage) replayAgentMessagesFromStdout(stdout)
-          if (!emittedAgentMessage) {
+          if (!pendingAgentMessages.length) replayAgentMessagesFromStdout(stdout)
+          if (!pendingAgentMessages.length) {
             const details = stdout.trim() || unparsedLines.join("\n").trim()
             finishWith(() =>
               onError(new Error(
@@ -248,6 +275,7 @@ export async function streamCodexCli(
               )),
             )
           } else {
+            pendingAgentMessages.forEach(emitAgentMessage)
             finishWith(onDone)
           }
         }
