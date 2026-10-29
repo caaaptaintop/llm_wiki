@@ -632,6 +632,9 @@ fn build_codex_cli_args(model: &str, isolate_local_config: bool) -> Result<Vec<S
         "--sandbox".to_string(),
         "read-only".to_string(),
         "--ephemeral".to_string(),
+        // This subprocess is a completion provider; source retrieval is owned by Wiki.
+        "-c".to_string(),
+        "features.shell_tool=false".to_string(),
         "--model".to_string(),
         model.to_string(),
         "-".to_string(),
@@ -1283,6 +1286,8 @@ mod tests {
         assert!(args.contains(&"gpt-5".to_string()));
         assert!(!args.contains(&"--ignore-user-config".to_string()));
         assert!(!args.contains(&"--ignore-rules".to_string()));
+        assert!(args.windows(2).any(|pair| pair[0] == "-c" && pair[1] == "features.shell_tool=false"));
+        assert!(args.windows(2).any(|pair| pair[0] == "--sandbox" && pair[1] == "read-only"));
     }
 
     #[test]

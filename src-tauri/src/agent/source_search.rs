@@ -13,6 +13,7 @@ struct Hit {
     reference: AgentReference,
     offset: usize,
     end_offset: usize,
+    explicit_table: bool,
 }
 
 pub(super) fn search(
@@ -64,6 +65,7 @@ pub(super) fn search_scoped(project_path: &str, query: &str, top_k: usize, sourc
         return Ok(Vec::new());
     }
     let limit = top_k.clamp(1, 10);
+    let requested_tables = labeled_numbers(query, &["表", "table"]);
     if source_paths.len() > limit { return Err(format!("选择了{}份来源，但检索预算只有{limit}条；请减少来源或增加 topK。", source_paths.len())); }
 
     let mut hits = Vec::<Hit>::new();
@@ -124,6 +126,9 @@ pub(super) fn search_scoped(project_path: &str, query: &str, top_k: usize, sourc
             for (start, end, score) in passage.windows(&terms, &phrase, cached, &stats) {
                 let (snippet, offset, end_offset) =
                     snippet_with_neighbors(&content, &passages, index, start, end, cached);
+                let explicit_table = table_after_caption(&passages, index)
+                    .filter(|number| requested_tables.contains(number))
+                    .is_some_and(|_| end_offset >= passages[index + 1].offset + passages[index + 1].text.len());
                 if let Some(hit) = hits.iter_mut().find(|hit| {
                     hit.reference.path == rel
                         && hit.offset == offset
@@ -132,6 +137,7 @@ pub(super) fn search_scoped(project_path: &str, query: &str, top_k: usize, sourc
                     // Several matching steps can expand to the same evidence.
                     // Keep its best anchor score without counting it repeatedly.
                     hit.reference.score = Some(hit.reference.score.unwrap_or(0.0).max(score));
+                    hit.explicit_table |= explicit_table;
                 } else {
                     hits.push(Hit {
                         reference: AgentReference {
@@ -144,14 +150,15 @@ pub(super) fn search_scoped(project_path: &str, query: &str, top_k: usize, sourc
                         },
                         offset,
                         end_offset,
+                        explicit_table,
                     });
                 }
                 // Keep memory bounded while still considering the whole walk.
                 hits.sort_by(|a, b| {
-                    b.reference
+                    b.explicit_table.cmp(&a.explicit_table).then_with(|| b.reference
                         .score
                         .partial_cmp(&a.reference.score)
-                        .unwrap()
+                        .unwrap())
                         .then_with(|| a.reference.path.cmp(&b.reference.path))
                         .then_with(|| a.offset.cmp(&b.offset))
                 });
@@ -315,6 +322,19 @@ pub(super) fn relevant_excerpt(content: &str, query: &str, budget: usize) -> Str
     let mut neighborhoods = std::collections::BTreeMap::new();
     for (index, p) in ps.iter().enumerate() {
         for (start, end, score) in p.windows(&terms, &query.to_lowercase(), false, &stats) {
+            // A section supplies the subject omitted by its follow-up paragraphs.
+            // Rank table rows independently so unrelated rows do not dilute a
+            // requested value, while returning the unchanged table with its scope.
+            let window = &p.text[start..end];
+            let score = if p.is_navigation(window) { score } else {
+                let quality = p.quality(window);
+                let section_score = stats.score(&prose_for_ranking(p.section).to_lowercase(), &terms) * 0.5 * quality;
+                let row_score = window.lines()
+                    .filter(|line| line.trim_start().starts_with('|'))
+                    .map(|line| stats.score(&prose_for_ranking(line).to_lowercase(), &terms) * quality)
+                    .fold(score, f64::max);
+                row_score + section_score
+            };
             let (offset, end_offset) = (p.offset + start, p.offset + end);
             neighborhoods.insert((offset, end_offset), snippet_with_neighbors(&text, &ps, index, start, end, false));
             if let Some(existing) = candidates.iter_mut().find(|c: &&mut (String, usize, usize, f64)| c.1 == offset && c.2 == end_offset) {
@@ -490,6 +510,11 @@ fn snippet_with_neighbors(
                 <= MAX_SOURCE_SNIPPET_CHARS
     };
     let (mut first, mut last) = (index, index);
+    // A continued-table caption belongs to the following rows. Expanding
+    // backward first can consume the budget with the previous page's table.
+    if table_after_caption(passages, index).is_some() && fits(&range(index, index + 1)) {
+        last += 1;
+    }
     loop {
         let mut expanded = false;
         if first > 0 && !passages[first - 1].heading && fits(&range(first - 1, last)) {
@@ -524,12 +549,29 @@ fn is_compound_figure_number(term: &str) -> bool {
         !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
 }
 
-fn figure_numbers(query: &str) -> Vec<String> {
+fn table_after_caption(passages: &[Passage<'_>], index: usize) -> Option<String> {
+    let caption = passages.get(index)?.text.trim().strip_prefix('续').unwrap_or(passages[index].text.trim());
+    let lower_caption = caption.to_ascii_lowercase();
+    let tail = caption.strip_prefix('表').or_else(|| lower_caption.strip_prefix("table"))?.trim_start();
+    let len = tail.bytes().take_while(|c| c.is_ascii_digit() || *c == b'-').count();
+    let number = &tail[..len];
+    if !is_compound_figure_number(number) || tail.as_bytes().get(len).is_some_and(|c| c.is_ascii_alphanumeric()) { return None; }
+    let body = passages.get(index + 1)?.text.trim_start();
+    let lower_body = body.to_ascii_lowercase();
+    let html_rows = lower_body.starts_with("<table") && lower_body.contains("</tr>")
+        && (lower_body.contains("<td") || lower_body.contains("<th"));
+    let markdown_rows = body.starts_with('|') && body.lines().nth(1).is_some_and(|line| line.contains("---"))
+        && body.lines().skip(2).any(|line| line.trim_start().starts_with('|'));
+    if !(html_rows || markdown_rows) { return None; }
+    Some(number.to_string())
+}
+
+fn labeled_numbers(query: &str, labels: &[&str]) -> Vec<String> {
     let lower = query.to_lowercase();
     let mut figures = Vec::new();
-    for label in ["图", "figure", "fig"] {
+    for &label in labels {
         for (start, _) in lower.match_indices(label) {
-            if label != "图" && start > 0 && lower.as_bytes()[start - 1].is_ascii_alphabetic() { continue; }
+            if label.is_ascii() && start > 0 && lower.as_bytes()[start - 1].is_ascii_alphabetic() { continue; }
             let tail = &lower[start + label.len()..];
             let tail = if label == "fig" { tail.strip_prefix('.').unwrap_or(tail) } else { tail };
             let tail = tail.trim_start();
@@ -549,9 +591,9 @@ fn retrieval_terms(query: &str) -> Vec<String> {
     // retain UR5 rather than treating its R5 suffix as a separate identifier.
     let identifiers: BTreeSet<String> = query.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|s| is_identifier(s)).map(str::to_ascii_lowercase).collect();
-    // The general tokenizer drops the single digits in “图7-9”. Preserve
-    // explicitly named compound figure numbers without boosting arbitrary dates.
-    let figures = figure_numbers(query);
+    // The general tokenizer drops the single digits in “图7-9” or “表5-21”.
+    // Preserve explicit figure/table numbers without boosting arbitrary dates.
+    let figures = labeled_numbers(query, &["图", "figure", "fig", "表", "table"]);
     tokenize_query(query).into_iter()
         .filter(|s| s.chars().count() >= 2 && (!is_identifier(s) || identifiers.contains(s)))
         .chain(identifiers.iter().cloned()).chain(figures).collect::<BTreeSet<_>>().into_iter().collect()
@@ -642,6 +684,21 @@ impl PassageStats {
 }
 
 impl Passage<'_> {
+    fn is_navigation(&self, text: &str) -> bool {
+        self.heading || text.lines().all(|line| {
+            let line = line.trim();
+            line.contains("](#")
+                || ((line.contains("..") || line.contains('…'))
+                    && line.split_whitespace().last().is_some_and(|s| s.parse::<usize>().is_ok()))
+        })
+    }
+
+    fn quality(&self, text: &str) -> f64 {
+        if self.is_navigation(text) { 0.05 }
+        else if text.chars().any(|c| matches!(c, '.' | '。' | '；' | ';' | '！' | '!' | '？' | '?')) || text.chars().count() >= 120 { 1.0 }
+        else { 0.5 }
+    }
+
     fn header(&self, start: usize, end: usize, cached: bool) -> String {
         let first = self.line + self.text[..start].bytes().filter(|b| *b == b'\n').count();
         let last = first
@@ -728,27 +785,7 @@ impl Passage<'_> {
             }
             // Unique term coverage dominates. Repeating a chapter title in a
             // TOC does not accumulate frequency points over an actual paragraph.
-            let navigation = self.heading
-                || text.lines().all(|line| {
-                    let line = line.trim();
-                    line.contains("](#")
-                        || ((line.contains("..") || line.contains('…'))
-                            && line
-                                .split_whitespace()
-                                .last()
-                                .is_some_and(|s| s.parse::<usize>().is_ok()))
-                });
-            let prose = text
-                .chars()
-                .any(|c| matches!(c, '.' | '。' | '；' | ';' | '！' | '!' | '？' | '?'))
-                || text.chars().count() >= 120;
-            let quality = if navigation {
-                0.05
-            } else if prose {
-                1.0
-            } else {
-                0.5
-            };
+            let quality = self.quality(text);
             let score =
                 (stats.score(&lower, terms) + if has_exact_phrase(&lower, phrase) { 2.0 } else { 0.0 }) * quality;
             windows.push((bounds[start], bounds[end], score));
@@ -769,6 +806,43 @@ mod tests {
         let excerpt = super::relevant_excerpt(&text, "A7 B8 C9 D6", 700);
         for code in ["A7", "B8", "C9", "D6"] { assert!(excerpt.contains(&format!("Probe {code}")), "{excerpt}"); }
         assert!(excerpt.chars().count() <= 700);
+    }
+
+    #[test]
+    fn section_subject_keeps_parameter_handoff_under_a_shared_budget() {
+        let mut text = String::from("# Operations\n\n");
+        for i in 0..6 {
+            text.push_str(&format!("## Background {i}\n\nPlanning and deployment require resources, trial review and records.\n\n"));
+        }
+        text.push_str("## Coating robot parameters\n\nQuantify parameters before operation and map the recorded fields to project codes.\n");
+        let excerpt = super::relevant_excerpt(&text, "planning deployment trial coating robot parameters records", 360);
+        assert!(excerpt.contains("map the recorded fields to project codes"), "{excerpt}");
+        assert!(excerpt.chars().count() <= 360);
+    }
+
+    #[test]
+    fn relevant_table_value_is_not_diluted_by_other_rows() {
+        let mut text = String::from("# Delivery\n\n");
+        for i in 0..5 {
+            text.push_str(&format!("## Overview {i}\n\nDelivery models are reviewed against contract requirements before handover.\n\n"));
+        }
+        text.push_str("## Model precision\n\n| Item | Requirement |\n| --- | --- |\n| Delivery model | Precision grade AQ or as contracted. |\n");
+        for item in ["Photo", "Video", "Archive", "Inventory", "Training", "Report"] {
+            text.push_str(&format!("| {item} | Record the date and responsible person. |\n"));
+        }
+        let excerpt = super::relevant_excerpt(&text, "delivery model precision grade contract requirements", 680);
+        assert!(excerpt.contains("Precision grade AQ or as contracted."), "{excerpt}");
+        assert!(excerpt.contains("| Item | Requirement |"));
+        assert!(excerpt.chars().count() <= 680);
+    }
+
+    #[test]
+    fn table_shaped_navigation_cannot_displace_parameter_evidence() {
+        let text = "# Page\n\n## Robot speed pressure\n\n| [robot speed pressure](#nav) |\n\n## Procedure\n\nRobot speed must be limited to 7 m/s. Check pressure before starting the operation.\n";
+        let excerpt = super::relevant_excerpt(text, "robot speed pressure", 160);
+        assert!(excerpt.contains("7 m/s"), "{excerpt}");
+        assert!(!excerpt.contains("](#nav)"));
+        assert!(excerpt.chars().count() <= 160);
     }
 
     #[test]
@@ -795,6 +869,56 @@ mod tests {
         assert!(super::retrieval_terms("图7-9与Fig. 7-11").contains(&"7-9".to_string()));
         assert!(!super::retrieval_terms("years 2009-2020").contains(&"2009-2020".to_string()));
         assert_eq!(super::term_matches("17-9 7-90 7-9-2 x7-9 7-9a 图 7-9。", "7-9").count(), 1);
+    }
+
+    #[test]
+    fn explicit_table_numbers_retrieve_the_requested_tables() {
+        let text = "# Sample catalogue\n\n表15-21 Unrelated long catalogue.\n\n## Inputs\n\n表5-21 Sample inputs: material and dimensions.\n\n## Outputs\n\n表5-22 Sample outputs: report and checklist.\n";
+        for query in ["表5-21 表5-22", "Table 5-21 Table 5-22"] {
+            assert!(super::retrieval_terms(query).contains(&"5-21".to_string()));
+            assert!(super::retrieval_terms(query).contains(&"5-22".to_string()));
+            let excerpt = super::relevant_excerpt(text, query, 210);
+            assert!(excerpt.contains("Sample inputs"), "{query}: {excerpt}");
+            assert!(excerpt.contains("Sample outputs"), "{query}: {excerpt}");
+            assert!(!excerpt.contains("Unrelated long catalogue"), "{query}: {excerpt}");
+            assert!(excerpt.chars().count() <= 210);
+        }
+        assert!(!super::retrieval_terms("timetable 5-21 years 2009-2020").contains(&"5-21".to_string()));
+    }
+
+    #[test]
+    fn requested_table_keeps_continuation_rows_before_generic_matches() {
+        let sources = Sources::new();
+        let text = format!("# Manual\n\n## Background\n\ninput output model report interface input output model report interface.\n\n## Results\n\n表5-21 output model report\n\n<!-- source-location: pdf-page:2/block:1 -->\n<table><tr><td>Main deliverable</td><td>{}</td></tr></table>\n<!-- source-location: unknown -->\n\n续表5-21\n\n<!-- source-location: pdf-page:3/block:1 -->\n<table><tr><td>Interface package</td><td>{}</td></tr></table>\n\n## Another table\n\n表6-21 output model report\n\n| Other | Rows |\n| --- | --- |\n| Irrelevant | Example |\n", "Payload. ".repeat(140), "Interface detail. ".repeat(30));
+        sources.write("tables.md", &text);
+        for query in ["表5-21 input output model report interface", "Table 5-21 input output model report interface"] {
+            let refs = super::search_scoped(sources.0.to_str().unwrap(), query, 2, &[]).unwrap();
+            assert_eq!(refs.len(), 2);
+            let snippets = refs.iter().map(|r| r.snippet.as_deref().unwrap()).collect::<Vec<_>>();
+            assert!(snippets.iter().any(|s| s.contains("Main deliverable")), "{snippets:?}");
+            let continuation = snippets.iter().find(|s| s.contains("Interface package")).expect("continued rows must be retrieved");
+            assert!(continuation.contains("续表5-21"));
+            assert!(continuation.contains("pdf-page:3/block:1"));
+            for snippet in snippets {
+                assert!(snippet.chars().count() <= super::MAX_SOURCE_SNIPPET_CHARS);
+                assert!(!snippet.contains("Irrelevant"));
+            }
+        }
+    }
+
+    #[test]
+    fn table_priority_requires_a_caption_and_actual_rows() {
+        let mixed = "Table 5-210 (compare 表5-21)\n\n<table><tr><td>Another table</td></tr></table>";
+        assert_eq!(super::table_after_caption(&super::passages(mixed, false), 0).as_deref(), Some("5-210"));
+        let sources = Sources::new();
+        let text = format!("# Manual\n\n## Discussion\n\n表明上述方法优于表5-21的方案；下面是另一实验。\n\n<table><tr><td>Unrelated experiment</td></tr></table>\n\n## Broken markup\n\n续表5-21\n\n<table>\n\n<tr><td>{}</td></tr>\n\n</table>\n\n## Actual table\n\nTable 5-21\n\n| Deliverable | Detail |\n| --- | --- |\n| Genuine result | Verified row |\n", "Long row. ".repeat(200));
+        sources.write("tables.md", &text);
+        let refs = super::search_scoped(sources.0.to_str().unwrap(), "表5-21", 1, &[]).unwrap();
+        assert_eq!(refs.len(), 1);
+        let snippet = refs[0].snippet.as_deref().unwrap();
+        assert!(snippet.contains("Genuine result"), "{snippet}");
+        assert!(!snippet.contains("Unrelated experiment"));
+        assert!(snippet.chars().count() <= super::MAX_SOURCE_SNIPPET_CHARS);
     }
 
     #[test]

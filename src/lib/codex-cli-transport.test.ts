@@ -94,6 +94,45 @@ describe("buildPrompt", () => {
 })
 
 describe("streamCodexCli", () => {
+  it.each(["missed", "partial"])("rejects truncated replay with a tool beyond the cap when live delivery is %s", async (delivery) => {
+    const callbacks = { onToken: vi.fn(), onDone: vi.fn(), onError: vi.fn() }
+    const stream = streamCodexCli(useWikiStore.getState().llmConfig, [{ role: "user", content: "Extract the supplied source." }], callbacks)
+    await vi.waitFor(() => expect(tauriMocks.invoke).toHaveBeenCalledTimes(1))
+    const { streamId } = tauriMocks.invoke.mock.calls[0][1] as { streamId: string }
+    const draft = JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "draft before later tool" } })
+    const reasoning = JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "x".repeat(1024) } })
+    const tool = JSON.stringify({ type: "item.started", item: { type: "command_execution", command: "read another page" } })
+    const fullOutput = draft + "\n" + (reasoning + "\n").repeat(1100) + tool
+    const stdout = fullOutput.slice(0, 1024 * 1024) + "\n[stdout truncated]"
+    expect(fullOutput).toContain(tool)
+    expect(stdout).not.toContain(tool)
+    if (delivery === "partial") tauriMocks.emit(`codex-cli:${streamId}`, draft)
+    tauriMocks.emit(`codex-cli:${streamId}:done`, { code: 0, stderr: "", stdout })
+    await stream
+    expect(callbacks.onToken).not.toHaveBeenCalled()
+    expect(callbacks.onDone).not.toHaveBeenCalled()
+    expect(callbacks.onError).toHaveBeenCalledOnce()
+  })
+
+  it.each(["live", "replay"])("rejects tool-contaminated output before exposing draft text in %s mode", async (mode) => {
+    const callbacks = { onToken: vi.fn(), onDone: vi.fn(), onError: vi.fn() }
+    const stream = streamCodexCli(useWikiStore.getState().llmConfig, [{ role: "user", content: "Extract the supplied source." }], callbacks)
+    await vi.waitFor(() => expect(tauriMocks.invoke).toHaveBeenCalledTimes(1))
+    const { streamId } = tauriMocks.invoke.mock.calls[0][1] as { streamId: string }
+    const lines = [
+      JSON.stringify({type: "item.completed", item: {type: "agent_message", text: "draft before tool"}}),
+      JSON.stringify({type: "item.started", item: {type: "command_execution", command: "read another page"}}),
+      JSON.stringify({type: "item.completed", item: {type: "agent_message", text: "contaminated completion"}}),
+    ]
+    if (mode === "live") lines.forEach(line => tauriMocks.emit(`codex-cli:${streamId}`, line))
+    tauriMocks.emit(`codex-cli:${streamId}:done`, {code: 0, stderr: "", stdout: lines.join("\n")})
+    await stream
+    expect(callbacks.onToken).not.toHaveBeenCalled()
+    expect(callbacks.onDone).not.toHaveBeenCalled()
+    expect(callbacks.onError).toHaveBeenCalledOnce()
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("codex_cli_kill", { streamId })
+  })
+
   it("passes original ContentBlock images as data-only IPC attachments in order", async () => {
     const callbacks = { onToken: vi.fn(), onDone: vi.fn(), onError: vi.fn() }
     const png = { type: "image" as const, mediaType: "image/png", dataBase64: "aGVsbG8=" }
@@ -635,7 +674,7 @@ describe("streamCodexCli", () => {
 
     await stream
 
-    expect(callbacks.onToken).toHaveBeenCalledWith("partial answer")
+    expect(callbacks.onToken).not.toHaveBeenCalled()
     expect(callbacks.onDone).not.toHaveBeenCalled()
     expect(callbacks.onError).toHaveBeenCalledTimes(1)
     expect((callbacks.onError.mock.calls[0]?.[0] as Error).message).toContain(

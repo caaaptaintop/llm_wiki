@@ -20,6 +20,22 @@ beforeEach(() => {
   useWikiStore.getState().setOutputLanguage("auto")
 })
 
+describe("knowledge and editorial assessment stay separate", () => {
+  it("keeps an analyst's audit checklist out of generated knowledge in every writing stage", () => {
+    for (const prompt of [buildAnalysisPrompt("", "", "source"), buildChunkAnalysisSystemPrompt("", "", "", "source"), buildGenerationPrompt("", "", "", "source.md"), buildPageMergeSystemPrompt()]) {
+      expect(prompt).toContain("核验者的评价、待办和软件维护记录不是原资料知识")
+      expect(prompt).toContain("不要为每页补一节证据边界、规程缺口或复现检查清单")
+      expect(prompt).toContain("保留来源明确的适用条件、作者局限和案例状态")
+      expect(prompt).toContain("每项事实在同一页只有一个主要位置")
+      expect(prompt).toContain("仅为导航的关联放入frontmatter related")
+      expect(prompt).toContain("出处与定位独立成段")
+      expect(prompt).toContain("<!-- wiki-evidence:start -->")
+      expect(prompt).toContain("知识结论、技术条件、案例结果、图片与代码必须在标记外")
+      expect(prompt).toContain("不能把整理者的核查步骤清单包装成领域知识")
+    }
+  })
+})
+
 describe("buildAnalysisPrompt language directive", () => {
   it("injects the user's explicit language setting", () => {
     useWikiStore.getState().setOutputLanguage("Chinese")

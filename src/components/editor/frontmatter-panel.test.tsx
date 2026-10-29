@@ -11,6 +11,16 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }))
 import { FrontmatterPanel } from "./frontmatter-panel"
 
 describe("compact metadata", () => {
+  it("deduplicates related aliases by file identity without mutating knowledge links", () => {
+    context.state = { project: { path: "/p" }, openPathInPreview: vi.fn(), projectPathIndex: buildProjectPathIndexFromTree(
+      ["/p/wiki/concepts/shared.md", "/p/wiki/methodology/shared.md"].map(path => ({ path, name: "shared.md", is_dir: false }))) }
+    const data = { related: ["concepts/shared", "wiki/concepts/shared.md", "[[concepts/shared|别名]]", "methodology/shared"] }
+    const before = JSON.stringify(data)
+    const html = renderToStaticMarkup(createElement(FrontmatterPanel, { data }))
+    expect(html.match(/<button/g)).toHaveLength(2)
+    expect(html).toContain("(2)")
+    expect(JSON.stringify(data)).toBe(before)
+  })
   it("deduplicates resolved paths, retains distinct same-title sources, and starts metadata closed", () => {
     context.state = { project: { path: "/p" }, openPathInPreview: vi.fn(), projectPathIndex: buildProjectPathIndexFromTree(
       ["/p/raw/sources/a/source.md", "/p/raw/sources/b/source.md"].map(path => ({ path, name: "source.md", is_dir: false }))) }

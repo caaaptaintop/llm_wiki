@@ -142,6 +142,17 @@ describe("raw source image resolver", () => {
     })
   })
 
+  it("prefers a delimited title over an adjacent same-number reference sentence", async () => {
+    const markdown = "Figure 2 depicts the sequence.\n\n<!-- source-location: pdf-page:5/block:2 -->\n![](images/chart.jpg)\n<!-- source-location: unknown -->\n\nFigure 2: Example sequence."
+    expect((await resolveFigureFixture(markdown))?.figureCaption).toEqual({
+      text: "Figure 2: Example sequence.", line: 7, sourceLocation: "unknown",
+    })
+    // Delimiters cannot resolve conflicting figure numbers or two titles.
+    for (const leading of ["Figure 3 depicts the sequence.", "Figure 2: Another title."]) {
+      expect((await resolveFigureFixture(markdown.replace("Figure 2 depicts the sequence.", leading)))?.figureCaption).toBeUndefined()
+    }
+  })
+
   it.each([
     "正文见图 7-9 进度跟踪", "图像 7-9 进度跟踪", "表 7-9 进度跟踪", "Figurehead 7 Tracking",
     "图 7-9所示为进度跟踪", "图 7-9", "![图 7-9 进度跟踪](images/other.jpg)",

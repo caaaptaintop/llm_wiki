@@ -339,7 +339,7 @@ export function buildImageMarkdownSection(
     s.replace(/[\r\n]+/g, " ").replace(/]/g, ")").trim()
 
   for (const key of ordered) {
-    lines.push(`### ${key}`, "")
+    if (key !== "Document") lines.push(`### ${key}`, "")
     for (const img of byPage.get(key) ?? []) {
       // Caption lookup by SHA-256 — same key the caption pipeline
       // uses to dedupe across documents. Falling back to empty alt

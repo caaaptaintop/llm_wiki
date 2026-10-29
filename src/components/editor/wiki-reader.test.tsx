@@ -82,6 +82,17 @@ beforeEach(() => {
 })
 
 describe("WikiReader navigation", () => {
+  it("follows a source line citation after its paragraph renders", () => {
+    context.state.pendingScrollHeading = { path: filePath, anchor: "L12" }
+    const scrollIntoView = vi.fn()
+    context.root.querySelectorAll.mockImplementation((selector: string) => selector === "[data-source-line-start]"
+      ? [{ dataset: { sourceLineStart: "10", sourceLineEnd: "14" }, scrollIntoView }]
+      : [])
+    render("内容")
+    context.effects.forEach(effect => effect())
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "auto", block: "start" })
+    expect(context.state.setPendingScrollHeading).toHaveBeenCalledWith(null)
+  })
   it("retains paragraph and image component types when navigation clears or reference titles arrive", () => {
     context.persistHooks = true
     let sourceOffset = 0
@@ -151,6 +162,16 @@ describe("WikiReader navigation", () => {
     context.state.projectPathIndex = buildProjectPathIndexFromTree([filePath, source].map(path => ({ name: path.split("/").pop()!, path, is_dir: false })))
     expect(click(`#${encodeURIComponent("raw/sources/指南/source.md")}`)).toHaveBeenCalledOnce()
     expect(context.state.openPathInPreview).toHaveBeenCalledWith(source)
+  })
+
+  it("folds resolved source references but keeps aliased knowledge and entity links visible", async () => {
+    const source = "/project/wiki/sources/research.md"
+    const entity = "/project/wiki/entities/device.md"
+    context.state.projectPathIndex = buildProjectPathIndexFromTree([filePath, source, entity].map(path => ({ name: path.split("/").pop()!, path, is_dir: false })))
+    const html = await renderMarkdown("来源：[[sources/research]]。\n\n证据：[[sources/research|仿真耗时4.48分钟]]。\n\n来源：[[entities/device]]。")
+    expect(html.match(/<details /g)).toHaveLength(1)
+    expect(html.indexOf("仿真耗时4.48分钟")).toBeGreaterThan(html.indexOf("</details>"))
+    expect(html.indexOf("#entities%2Fdevice")).toBeGreaterThan(html.indexOf("</details>"))
   })
 
   it("displays resolved page titles while preserving explicit aliases and original navigation", () => {

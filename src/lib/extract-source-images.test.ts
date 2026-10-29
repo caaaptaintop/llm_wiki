@@ -57,6 +57,7 @@ describe("extractAndSaveSourceImages", () => {
       figureCaption: { text: title, line: 5092, sourceLocation: "unknown" },
     }]]))
     expect(section).toContain(`![${title}；${description}](${image.relPath})`)
+    expect(section).not.toContain("### Document")
     expect(section).toContain(`\n${title}\n`)
     expect(section).toContain("出处：[[raw/sources/book/source.md]]，行 5089；pdf-page:148/block:4。")
     expect(section).toContain("图题出处：[[raw/sources/book/source.md]]，行 5092；unknown。")
